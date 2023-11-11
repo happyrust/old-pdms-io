@@ -79,7 +79,7 @@ impl PdmsWatcher {
                 io.open()?;
                 if let Ok(basic_info) = io.get_page_basic_info() {
                     // let new_ses_no = basic_info.latest_ses_pageno + 1;
-                    if let Some(mut old) = self.headers.get_mut(&path.to_path_buf()) {
+                    if let Some(old) = self.headers.get_mut(&path.to_path_buf()) {
                         //未发生修改，直接跳过
                         if old.pdms_header.page_no == basic_info.pdms_header.page_no { continue; }
                     }
@@ -134,7 +134,7 @@ impl PdmsWatcher {
             let mut io = PdmsIO::new(path, true);
             io.open()?;
             let basic_info = io.get_page_basic_info()?;
-            println!("basic info: {:#4X?}", &basic_info);
+            // println!("basic info: {:#4X?}", &basic_info);
             let new_ses_no = basic_info.latest_ses_pageno + 1;
             result.insert(path.as_ref().to_path_buf(), basic_info);
         }
