@@ -6,10 +6,12 @@ use serde::{Deserialize, Serialize};
 
 pub const PAGE_SIZE: usize = 0x800;
 
+// By default it uses the system endianness, but can be overwritten
 #[derive(Default, Clone, Debug, PartialEq, DekuRead, DekuWrite, Serialize, Deserialize)]
-#[deku(endian = "big")] // By default it uses the system endianness, but can be overwritten
+#[deku(endian = "big")]
 pub struct PdmsHeader {
-    pub unknown_0: [i32; 2], //头3个
+    //开头两个未知
+    pub unknown_0: [i32; 2],
     pub db_num: i32,
     pub unknown_1: [i32; 5],  //然后是 00 00 00 01
     pub noun: i32,
@@ -40,6 +42,7 @@ pub struct DbPageBasicInfo{
     pub latest_ses_data: SessionPageData,
     //暂时通过记录file的大小来实现增量更新
     pub file_size: u64,
+    // pub timestamp: DateTime<Utc>,
 }
 
 ///会话层的定位信息
@@ -190,9 +193,6 @@ fn read_refno_data_loc(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>
     Ok((rest, vec))
 }
 
-// #[deku(reader = "read_things(deku::rest)")]
-// things: Vec<Thing>,
-
 fn read_refno_index_pgid(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoIndexPgId>), DekuError> {
     let mut pgids = Vec::new();
     let mut rest = rest;
@@ -209,12 +209,6 @@ fn read_refno_index_pgid(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb
     Ok((rest, pgids))
 }
 
-// #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-// pub struct ElePageHeaderData {
-//     #[deku(endian = "big")]
-//     pub page_type: i32,
-//     pub headers: Vec<EleHeaderData>,
-// }
 
 //todo 需要处理跨页的数据
 #[derive(Clone, Debug, PartialEq, Default, DekuRead, DekuWrite)]
@@ -280,10 +274,8 @@ impl EleRawData {
 }
 
 
-
-
 fn read_members(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Option<EleMembers>), DekuError> {
-    let (next_rest, peek) = u16::read(rest, Endian::Big)?;
+    let (_next_rest, peek) = u16::read(rest, Endian::Big)?;
     if peek != 0x2 {
         return Ok((rest, None));
     }

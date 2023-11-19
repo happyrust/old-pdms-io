@@ -12,7 +12,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 use dashmap::DashMap;
+use dpcsync::chunker;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinSet;
+use crate::sync::compress::{CompressOptions, execute_compress};
+use crate::sync::sync::compress_archive;
 
 #[test]
 fn test_watch() {
@@ -47,82 +51,75 @@ impl PdmsWatcher {
         }
     }
 
-    pub fn save(&self) -> anyhow::Result<()> {
-        let mut file = File::create("watcher.json")?;
+    pub fn save(&self, path: Option<&str>) -> anyhow::Result<()> {
+        let mut file = File::create(path.unwrap_or("watcher.json"))?;
         file.write_all(serde_json::to_string(self)?.as_bytes())?;
         Ok(())
     }
 
-    pub fn load_from_json() -> anyhow::Result<Self> {
-        let mut file = File::open("watcher.json")?;
+    pub fn load_from_json(path: Option<&str>) -> anyhow::Result<Self> {
+        let mut file = File::open(path.unwrap_or("watcher.json"))?;
         let mut string = String::new();
         file.read_to_string(&mut string)?;
         let w = serde_json::from_str(string.as_str())?;
         Ok(w)
     }
 
-    pub fn init_local_watcher(&self) -> anyhow::Result<()> {
+    pub async fn init_local_watcher(&self) -> anyhow::Result<()> {
         for watch_dir in &self.watch_dirs {
+            let mut join_set = JoinSet::new();
+            //在dir_entry 下创建 cbas目录
+            let mut cbas_dir = watch_dir.clone();
+            cbas_dir.push("cbas");
+            let cbas_dir_path = cbas_dir.to_string_lossy().to_string();
+            if !cbas_dir.exists() {
+                std::fs::create_dir_all(cbas_dir)?;
+            }
             for entry in WalkDir::new(watch_dir).sort_by(|a, b| {
-                b.path()
+                a.path()
                     .metadata()
                     .unwrap()
                     .len()
-                    .cmp(&a.path().metadata().unwrap().len())
+                    .cmp(&b.path().metadata().unwrap().len())
             }) {
                 let dir_entry = entry.unwrap();
                 let path = dir_entry.path();
-                if path.is_dir() {
+                //只处理0001 结尾的文件
+                let file_name = path.file_stem().unwrap().to_str().unwrap();
+                if path.is_dir() || !file_name.ends_with("0001"){
                     continue;
                 }
                 let mut io = PdmsIO::new(path, true);
                 io.open()?;
                 if let Ok(basic_info) = io.get_page_basic_info() {
-                    // let new_ses_no = basic_info.latest_ses_pageno + 1;
                     if let Some(old) = self.headers.get_mut(&path.to_path_buf()) {
                         //未发生修改，直接跳过
                         if old.pdms_header.page_no == basic_info.pdms_header.page_no { continue; }
                     }
-
                     self.headers.insert(path.to_path_buf(), basic_info);
                 }
+
+                //初始化CBA的Archive文件，来保证后续增量下载
+                let input= path.to_path_buf();
+                let output: PathBuf = format!("{}/{}.cba", &cbas_dir_path, file_name).into();
+                // dbg!(&output);
+                join_set.spawn(async move {
+                    // compress_archive(
+                    //     input,
+                    //     output,
+                    //     chunker::Config::BuzHash(chunker::FilterConfig::default()),
+                    //     Some(dpcsync::CompressionAlgorithm::Brotli),
+                    // ).await;
+                    let compress_opt = CompressOptions::new(input, output);
+                    // dbg!(&compress_opt);
+                    execute_compress(compress_opt).await.unwrap();
+                });
             }
+            while let Some(_) = join_set.join_next().await {}
         }
 
         anyhow::Ok(())
     }
-
-    // pub async fn async_watch(&self) -> notify::Result<()> {
-    //
-    //     let (mut watcher, mut rx) = Self::async_watcher()?;
-    //     self.watch_dirs.iter().for_each(|x|{
-    //         watcher.watch(x.as_path(), RecursiveMode::NonRecursive);
-    //     });
-    //
-    //     let mut params = IndexMap::new();
-    //     while let Some(res) = rx.next().await {
-    //         match res {
-    //             Ok(event) => {
-    //                 println!("changed: {:?}", &event);
-    //                 if let Ok(new_headers) = Self::scan_db_headers(event.paths){
-    //                     // dbg!(&new_headers);
-    //                     for (path, new_header) in new_headers {
-    //                         if let Some(old) = self.headers.get(&path) {
-    //                             //未发生修改，直接跳过
-    //                             if old.pdms_header.page_no == new_header.pdms_header.page_no { continue;  }
-    //                             let range = (old.file_size..new_header.file_size);
-    //                             params.insert(path.clone(), range);
-    //                             self.headers.insert(path, new_header);
-    //                         }
-    //                     }
-    //                 }
-    //             }
-    //             Err(e) => println!("watch error: {:?}", e),
-    //         }
-    //     }
-    //
-    //     Ok(())
-    // }
 
 
     ///扫描出来每个db文件的 header信息
