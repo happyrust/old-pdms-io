@@ -8,6 +8,9 @@ use aios_core::get_db_option;
 use dpcsync::chunker;
 use std::path::PathBuf;
 use std::time::Instant;
+use log::LevelFilter;
+use crate::io_log::init_log;
+use crate::sync::clone::{CloneOptions, execute_clone};
 use crate::sync::compress::{CompressOptions, execute_compress};
 
 #[tokio::test]
@@ -16,7 +19,7 @@ pub async fn test_sync_remote_files() {
 }
 
 #[tokio::test]
-pub async fn test_gen_cba_file() {
+pub async fn test_compress_file() {
     let db_option = get_db_option();
     let dir = format!(
         "{}/AvevaMarineSample/ams000/",
@@ -27,7 +30,7 @@ pub async fn test_gen_cba_file() {
     // let output: PathBuf = format!("{}/{}.cba", &dir, "test7351").into();
     // dbg!(&output);
 
-    let input: PathBuf = format!("{}/{}", &dir, "ams1112_0001 copy-backup").into();
+    let input: PathBuf = format!("{}/{}", &dir, "ams1112_0001").into();
     dbg!(&input);
     let file_name = input.file_stem().unwrap().to_str().unwrap();
     dbg!(file_name);
@@ -38,5 +41,30 @@ pub async fn test_gen_cba_file() {
     let compress_opt = CompressOptions::new(input, output);
     // dbg!(&compress_opt);
     execute_compress(compress_opt).await.unwrap();
+    println!("compress_archive cost: {:?}", time.elapsed().as_secs_f64());
+}
+
+
+#[tokio::test]
+pub async fn test_clone_file() {
+    let db_option = get_db_option();
+    init_log(LevelFilter::Debug).unwrap();
+    let dir = format!(
+        "{}/AvevaMarineSample/ams000/",
+        db_option.project_path.as_str()
+    );
+    // let input: PathBuf = format!("{}/{}", &dir, "ams7351_0001").into();
+    // dbg!(&input);
+    // let output: PathBuf = format!("{}/{}.cba", &dir, "test7351").into();
+    // dbg!(&output);
+
+    let e3d_file: PathBuf = format!("{}{}", &dir, "ams1112_0001").into();
+    dbg!(&e3d_file);
+    let cba_file: PathBuf = format!("{}{}.cba", &dir, "test1112").into();
+    dbg!(&cba_file);
+    let mut time = Instant::now();
+    let clone_opt = CloneOptions::new(cba_file, e3d_file);
+    // dbg!(&compress_opt);
+    execute_clone(clone_opt).await.unwrap();
     println!("compress_archive cost: {:?}", time.elapsed().as_secs_f64());
 }

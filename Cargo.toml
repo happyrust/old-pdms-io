@@ -30,6 +30,8 @@ futures-util = "0.3.29"
 log = "0.4.20"
 atty = "0.2.14"
 num_cpus = "1.16.0"
+url = "2.4.1"
+fern = "0.6.2"
 
 [profile.dev]
 opt-level = 0

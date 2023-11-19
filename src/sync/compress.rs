@@ -156,15 +156,14 @@ pub struct CompressOptions {
 }
 
 impl CompressOptions {
-    pub(crate) fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U) -> Self {
+    pub fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U) -> Self {
         let mut filter_config = chunker::FilterConfig::default();
         let num_chunk_buffers: usize =
             match num_cpus::get() {
                 // Single buffer if we have a single core, otherwise number of cores x 2
                 0 | 1 => 1,
                 n => n * 2,
-            }
-            ;
+            };
         filter_config.window_size = 8;
         let temp_file = output.as_ref().with_extension(".tmp");
         Self {

@@ -8,5 +8,7 @@ pub mod sync;
 
 pub mod watch;
 
+pub mod io_log;
+
 
 
