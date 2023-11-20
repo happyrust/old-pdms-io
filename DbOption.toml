@@ -37,6 +37,8 @@ rebuild_ssc_tree = false
 arangodb_user = "root"
 arangodb_password = ""
 
+remote_file_hosts = []
+
 #tidb 配置
 ip = "127.0.0.1"
 user = "root"

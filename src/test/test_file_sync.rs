@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use log::LevelFilter;
 use crate::io_log::init_log;
-use crate::sync::clone::{CloneOptions, execute_clone};
+use crate::sync::clone::{CloneOptions, execute_clone, InputArchive};
 use crate::sync::compress::{CompressOptions, execute_compress};
 
 #[tokio::test]
@@ -32,16 +32,13 @@ pub async fn test_compress_file() {
 
     let input: PathBuf = format!("{}/{}", &dir, "ams1112_0001").into();
     dbg!(&input);
-    let file_name = input.file_stem().unwrap().to_str().unwrap();
-    dbg!(file_name);
-    dbg!(file_name.ends_with("0001"));
     let output: PathBuf = format!("{}/{}.cba", &dir, "test1112").into();
     dbg!(&output);
     let mut time = Instant::now();
     let compress_opt = CompressOptions::new(input, output);
     // dbg!(&compress_opt);
     execute_compress(compress_opt).await.unwrap();
-    println!("compress_archive cost: {:?}", time.elapsed().as_secs_f64());
+    println!("compress_archive cost: {:?}s", time.elapsed().as_secs_f64());
 }
 
 
@@ -58,13 +55,20 @@ pub async fn test_clone_file() {
     // let output: PathBuf = format!("{}/{}.cba", &dir, "test7351").into();
     // dbg!(&output);
 
+    let url = "http://50c170h624.zicp.vip:56785/asset/archives/ams1112_0001.cba";
     let e3d_file: PathBuf = format!("{}{}", &dir, "ams1112_0001").into();
     dbg!(&e3d_file);
     let cba_file: PathBuf = format!("{}{}.cba", &dir, "test1112").into();
     dbg!(&cba_file);
+    let remote_cba = "";
     let mut time = Instant::now();
-    let clone_opt = CloneOptions::new(cba_file, e3d_file);
+    let local_clone_opt = CloneOptions::new_local(
+        cba_file,
+        e3d_file.clone());
+    let remote_clone_opt = CloneOptions::new_remote(
+        url,
+        e3d_file);
     // dbg!(&compress_opt);
-    execute_clone(clone_opt).await.unwrap();
-    println!("compress_archive cost: {:?}", time.elapsed().as_secs_f64());
+    execute_clone(remote_clone_opt).await.unwrap();
+    println!("compress_archive cost: {:?}s", time.elapsed().as_secs_f64());
 }

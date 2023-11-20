@@ -159,7 +159,7 @@ where
     Ok(index)
 }
 
-async fn clone_archive<R>(opts: CloneOptions, reader: R) -> Result<()>
+async fn clone_archive<R>(opts: CloneOptions, reader: R) -> Result<bool>
 where
     R: ArchiveReader,
     R::Error: std::error::Error + Send + Sync + 'static,
@@ -170,6 +170,24 @@ where
     ))?;
     let clone_index = archive.build_source_index();
     let mut total_read_from_seed = 0u64;
+
+    // dbg!(archive.total_source_size());
+
+    // Create or open output file
+    let mut output_file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .read(opts.verify_output || opts.seed_output)
+        .create(opts.force_create || opts.seed_output)
+        .create_new(!opts.force_create && !opts.seed_output)
+        .open(&opts.output)
+        .await
+        .context(format!("Failed to open {}", opts.output.display()))?;
+
+    // dbg!(output_file.metadata().await?.len());
+    //如果文件大小比remote的大，就不用下载了
+    if archive.total_source_size()  <= output_file.metadata().await?.len() {
+        return Ok(false);
+    }
 
     // info_cmd::print_archive(&archive);
     // println!();
@@ -187,16 +205,6 @@ where
         opts.input_archive.source(),
         opts.output.display()
     );
-
-    // Create or open output file
-    let mut output_file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .read(opts.verify_output || opts.seed_output)
-        .create(opts.force_create || opts.seed_output)
-        .create_new(!opts.force_create && !opts.seed_output)
-        .open(&opts.output)
-        .await
-        .context(format!("Failed to open {}", opts.output.display()))?;
 
     // Check if the given output file is a regular file or block device.
     // If it is a block device we should check its size against the target size before
@@ -336,7 +344,7 @@ where
         human_size!(total_read_from_seed)
     );
 
-    Ok(())
+    Ok(true)
 }
 
 #[derive(Debug, Clone)]
@@ -377,7 +385,7 @@ pub struct CloneOptions {
 
 impl CloneOptions{
 
-    pub fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U) -> Self {
+    pub fn new_local<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U) -> Self {
         let num_chunk_buffers: usize =
             match num_cpus::get() {
                 // Single buffer if we have a single core, otherwise number of cores x 2
@@ -396,9 +404,37 @@ impl CloneOptions{
             num_chunk_buffers,
         }
     }
+
+    pub fn new_remote<U: AsRef<Path>>(url: &str, output: U) -> Self {
+        let url = url.parse::<Url>().unwrap();
+        let num_chunk_buffers: usize =
+            match num_cpus::get() {
+                // Single buffer if we have a single core, otherwise number of cores x 2
+                0 | 1 => 1,
+                n => n * 2,
+            };
+        Self{
+            force_create: true,
+            input_archive: InputArchive::Remote(Box::new(RemoteInput{
+                url,
+                retries: 3,
+                retry_delay: Duration::from_secs(10),
+                receive_timeout: None,
+                headers: HeaderMap::new(),
+            })),
+            header_checksum: None,
+            output: output.as_ref().to_path_buf(),
+            seed_stdin: false,
+            seed_files: Vec::new(),
+            seed_output: true,
+            verify_output: true,
+            num_chunk_buffers,
+        }
+    }
+
 }
 
-pub async fn execute_clone(opts: CloneOptions) -> Result<()> {
+pub async fn execute_clone(opts: CloneOptions) -> Result<bool> {
     match opts.input_archive.clone() {
         InputArchive::Local(path) => {
             clone_archive(

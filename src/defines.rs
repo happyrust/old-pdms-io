@@ -159,7 +159,7 @@ pub struct RefnoIndexPage {
 pub struct IndexPageData {
     // #[deku(endian = "big")]
     pub page_type: i32,
-    #[deku(assert_eq = "0xCC47DF")]
+    // #[deku(assert_eq = "0xCC47DF")]
     pub noun: i32,
     //00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00
     // #[deku(endian = "big")]

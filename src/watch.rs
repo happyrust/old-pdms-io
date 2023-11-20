@@ -41,6 +41,8 @@ fn test_watch() {
 pub struct PdmsWatcher {
     pub watch_dirs: Vec<PathBuf>,
     pub headers: DashMap<PathBuf, DbPageBasicInfo>,
+    //还需要存储一下每个文件对应的完整目录
+    pub file_name_full_path_map: DashMap<String, PathBuf>,
 }
 
 impl PdmsWatcher {
@@ -48,6 +50,7 @@ impl PdmsWatcher {
         Self {
             watch_dirs: dirs.into_iter().map(|x| x.as_ref().to_path_buf()).collect(),
             headers: Default::default(),
+            file_name_full_path_map: Default::default(),
         }
     }
 
@@ -89,6 +92,7 @@ impl PdmsWatcher {
                 if path.is_dir() || !file_name.ends_with("0001"){
                     continue;
                 }
+                self.file_name_full_path_map.insert(file_name.to_owned(), path.to_path_buf());
                 let mut io = PdmsIO::new(path, true);
                 io.open()?;
                 if let Ok(basic_info) = io.get_page_basic_info() {
@@ -102,16 +106,8 @@ impl PdmsWatcher {
                 //初始化CBA的Archive文件，来保证后续增量下载
                 let input= path.to_path_buf();
                 let output: PathBuf = format!("{}/{}.cba", &cbas_dir_path, file_name).into();
-                // dbg!(&output);
                 join_set.spawn(async move {
-                    // compress_archive(
-                    //     input,
-                    //     output,
-                    //     chunker::Config::BuzHash(chunker::FilterConfig::default()),
-                    //     Some(dpcsync::CompressionAlgorithm::Brotli),
-                    // ).await;
                     let compress_opt = CompressOptions::new(input, output);
-                    // dbg!(&compress_opt);
                     execute_compress(compress_opt).await.unwrap();
                 });
             }

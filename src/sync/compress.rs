@@ -165,7 +165,7 @@ impl CompressOptions {
                 n => n * 2,
             };
         filter_config.window_size = 8;
-        let temp_file = output.as_ref().with_extension(".tmp");
+        let temp_file = output.as_ref().with_extension("tmp");
         Self {
             force_create: true,
             input: Some(input.as_ref().to_path_buf()),
