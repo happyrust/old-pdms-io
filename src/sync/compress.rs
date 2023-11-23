@@ -11,7 +11,7 @@ use tokio::{
 };
 
 use crate::{human_size /*info_cmd*/};
-use dpcsync::{archive_reader::IoReader, chunk_dictionary as dict};
+use dpcsync::{archive_reader::IoReader, chunk_dictionary as dict, HashSum};
 use dpcsync::{chunker, Compression};
 
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -179,7 +179,7 @@ impl CompressOptions {
     }
 }
 
-pub async fn execute_compress(opts: CompressOptions) -> Result<()> {
+pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
     let chunker_config = opts.chunker_config.clone();
     let compression = opts.compression;
     let mut time = Instant::now();
@@ -253,6 +253,7 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<()> {
         },
     };
 
+    let hash_sum = HashSum::from(source_hash.clone());
     // Build the final archive
     let file_header = dict::ChunkDictionary {
         rebuild_order: chunk_order.iter().map(|&index| index as u32).collect(),
@@ -290,5 +291,5 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<()> {
         // info_cmd::print_archive_reader(reader).await?;
     }
     println!("Archive created {} in {}", &input_path, time.elapsed().as_secs_f32());
-    Ok(())
+    Ok(hash_sum)
 }

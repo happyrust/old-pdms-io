@@ -185,8 +185,10 @@ where
 
     // dbg!(output_file.metadata().await?.len());
     //如果文件大小比remote的大，就不用下载了
-    if archive.total_source_size()  <= output_file.metadata().await?.len() {
-        return Ok(false);
+    if opts.check_size {
+        if archive.total_source_size()  <= output_file.metadata().await?.len() {
+            return Ok(false);
+        }
     }
 
     // info_cmd::print_archive(&archive);
@@ -381,6 +383,8 @@ pub struct CloneOptions {
     pub seed_output: bool,
     pub verify_output: bool,
     pub num_chunk_buffers: usize,
+    //如果archive对应的数据文件小，则不更新
+    pub check_size: bool,
 }
 
 impl CloneOptions{
@@ -402,6 +406,7 @@ impl CloneOptions{
             seed_output: true,
             verify_output: true,
             num_chunk_buffers,
+            check_size: false,
         }
     }
 
@@ -429,6 +434,7 @@ impl CloneOptions{
             seed_output: true,
             verify_output: true,
             num_chunk_buffers,
+            check_size: false,
         }
     }
 
