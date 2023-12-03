@@ -1,16 +1,18 @@
+use aios_core::get_default_pdms_db_info;
+use aios_core::pdms_types::{PdmsElement, RefU64};
 use std::collections::{BTreeMap, BTreeSet};
+use std::convert::TryInto;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::convert::TryInto;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use aios_core::get_default_pdms_db_info;
-use aios_core::pdms_types::{PdmsElement, RefU64};
 // use crate::common::get_parsed_data;
-use crate::defines::{IndexPageData, DbPageBasicInfo, PdmsHeader, RefnoIndexPage, RootIndexPage, SessionPageData};
-use parse_pdms_db::parse::{parse_attr_members, parse_ele_data, parse_ele_membs};
+use crate::defines::{
+    DbPageBasicInfo, IndexPageData, PdmsHeader, RefnoIndexPage, RootIndexPage, SessionPageData,
+};
 use parse_pdms_db::parse::EleData;
+use parse_pdms_db::parse::{parse_attr_members, parse_ele_data, parse_ele_membs};
 
 #[derive(Debug)]
 pub struct PdmsIO {
@@ -19,42 +21,39 @@ pub struct PdmsIO {
     pub file: Option<File>,
 }
 
-
 impl PdmsIO {
-
     ///新建一个PdmsIO
     pub fn new<P: AsRef<Path>>(path: P, readonly: bool) -> Self {
-        Self{
+        Self {
             path: path.as_ref().to_path_buf(),
             readonly,
             file: None,
         }
     }
 
-    pub fn open(&mut self) -> anyhow::Result<()>{
+    pub fn open(&mut self) -> anyhow::Result<()> {
         let mut file = File::options().read(self.readonly).open(&self.path)?;
         self.file = Some(file);
         Ok(())
     }
 
     ///获取单个element数据
-    pub fn get_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData>{
+    pub async fn get_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
         let mut file = self.file.as_mut().unwrap();
         let mut data = vec![0u8; 0x800];
         file.seek(SeekFrom::Start(refno_offset))?;
         file.read_exact(&mut data)?;
 
-        let m = &get_default_pdms_db_info().noun_attr_info_map;
         let input = if data[..4] == [0, 0, 0, 0x7] {
             &data[4..]
-        }else{
+        } else {
             &data[..]
         };
-        parse_ele_data(input, m)
+        parse_ele_data(input).await
     }
 
     ///获得page的信息
-    pub fn get_page_basic_info(&mut self) -> anyhow::Result<DbPageBasicInfo>{
+    pub fn get_page_basic_info(&mut self) -> anyhow::Result<DbPageBasicInfo> {
         let pdms_header = self.read_pdms_header()?;
         // println!("{:#04X?}", &pdms_header);
         let latest_ses_pageno = pdms_header.page_no;
@@ -69,7 +68,7 @@ impl PdmsIO {
     }
 
     #[inline]
-    pub fn read_pdms_header(&mut self) -> anyhow::Result<PdmsHeader>{
+    pub fn read_pdms_header(&mut self) -> anyhow::Result<PdmsHeader> {
         let mut file = self.file.as_mut().unwrap();
         file.seek(SeekFrom::Start(0u64))?;
         let mut head_data = vec![];
@@ -80,7 +79,7 @@ impl PdmsIO {
     }
 
     #[inline]
-    pub fn read_ses_data(&mut self, ses_pageno: u32) -> anyhow::Result<SessionPageData>{
+    pub fn read_ses_data(&mut self, ses_pageno: u32) -> anyhow::Result<SessionPageData> {
         let mut file = self.file.as_mut().unwrap();
         let mut ses_data = vec![];
         ses_data.resize(size_of::<SessionPageData>(), 0u8);
@@ -91,7 +90,7 @@ impl PdmsIO {
     }
 
     #[inline]
-    pub fn read_index_data(&mut self, index_pageno: u32) -> anyhow::Result<IndexPageData>{
+    pub fn read_index_data(&mut self, index_pageno: u32) -> anyhow::Result<IndexPageData> {
         let mut file = self.file.as_mut().unwrap();
         let mut ses_data = vec![];
         ses_data.resize(0x800, 0u8);
@@ -102,7 +101,11 @@ impl PdmsIO {
     }
 
     ///收集发生修改的参考号直到某个pageno为止,
-    pub fn collect_increment_eles(&mut self, basic_info: &DbPageBasicInfo, till_pageno: Option<u32>) -> anyhow::Result<Vec<EleData>>{
+    pub async fn collect_increment_eles(
+        &mut self,
+        basic_info: &DbPageBasicInfo,
+        till_pageno: Option<u32>,
+    ) -> anyhow::Result<Vec<EleData>> {
         let mut ses_info = self.get_page_basic_info()?;
         let mut cur_ses_page = ses_info.latest_ses_data.clone();
         let cur_page = ses_info.pdms_header.page_no;
@@ -131,21 +134,27 @@ impl PdmsIO {
                     break;
                 }
             }
-            if let Ok(cur_index_page) = self.read_index_data(offset_page){
+            if let Ok(cur_index_page) = self.read_index_data(offset_page) {
                 // dbg!(&cur_index_page);
                 // dbg!(&last_ses_page);
                 //找到最近的索引
-                if cur_index_page.index == 0  {
+                if cur_index_page.index == 0 {
                     // println!("offset: ({:#04X?}, {:#04X?})", offset_page, offset_page * 0x800);
-                    let nearest_loc = cur_index_page.refno_locs
+                    let nearest_loc = cur_index_page
+                        .refno_locs
                         .iter()
                         //todo 需要弄清楚 00 02 C9 59， 这里的00 02 是什么含义
-                        .filter(|x| x.page_no > last_ses_page && x.page_no < basic_info.pdms_header.page_no )
-                        .for_each(|x|{
+                        .filter(|x| {
+                            x.page_no > last_ses_page && x.page_no < basic_info.pdms_header.page_no
+                        })
+                        .for_each(|x| {
                             // println!("Found loc: {:#04X?}", x);
-                            let data_page_offset = x.page_no as u64 * 0x800 ;
+                            let data_page_offset = x.page_no as u64 * 0x800;
                             let refno_att_offset = data_page_offset + x.offset as u64 * 2;
-                            refno_data_offsets_map.insert(RefU64::from_two_nums(x.refno_0, x.refno_1), refno_att_offset);
+                            refno_data_offsets_map.insert(
+                                RefU64::from_two_nums(x.refno_0, x.refno_1),
+                                refno_att_offset,
+                            );
                             // println!("data_offset: {:#04X?}", refno_att_offset);
                         });
                 }
@@ -158,7 +167,7 @@ impl PdmsIO {
                     //重置索引
                     i = 0;
                     continue;
-                }else{
+                } else {
                     break;
                 }
             }
@@ -168,7 +177,7 @@ impl PdmsIO {
         let mut eles = Vec::with_capacity(refno_data_offsets_map.len());
         for (refno, offset) in refno_data_offsets_map {
             // dbg!(refno);
-            match self.get_element(offset){
+            match self.get_element(offset).await {
                 Ok(ele) => {
                     eles.push(ele);
                 }
@@ -183,7 +192,6 @@ impl PdmsIO {
     }
 
     pub fn search_refno(&mut self, refno: RefU64) -> anyhow::Result<bool> {
-
         let mut file = self.file.as_mut().unwrap();
         file.seek(SeekFrom::Start(0u64))?;
         let mut head_data = vec![];
@@ -226,9 +234,11 @@ impl PdmsIO {
 
         //先搜索这个最大的范围，然后再缩小范围
         //here we need a loop to find the right location range
-        let root_loc = if refno.get_0() == l.refno_0 && (refno.get_1() >= l.refno_1 && refno.get_1() < u.refno_1 )  {
+        let root_loc = if refno.get_0() == l.refno_0
+            && (refno.get_1() >= l.refno_1 && refno.get_1() < u.refno_1)
+        {
             Some(l)
-        }else{
+        } else {
             None
         };
 
@@ -244,13 +254,18 @@ impl PdmsIO {
         // println!("{:#04X?}", &index_pgid);
 
         //todo 使用memchr直接去找到目标refno
-        let target_refno_loc = index_pgid.data_locs.iter().position(|x| x.refno_0 == refno.get_0() && x.refno_1 > refno.get_1());
+        let target_refno_loc = index_pgid
+            .data_locs
+            .iter()
+            .position(|x| x.refno_0 == refno.get_0() && x.refno_1 > refno.get_1());
         let target_refno_pgid = if let Some(mut t) = target_refno_loc {
-            if t > 0 { t = t - 1; }
+            if t > 0 {
+                t = t - 1;
+            }
             let target_refno_pgid = &index_pgid.data_locs[t];
             println!("target_refno_pgid: {:#04X?}", target_refno_pgid);
             Some(target_refno_pgid)
-        }else{
+        } else {
             None
         };
 
@@ -265,7 +280,10 @@ impl PdmsIO {
         let index_data = IndexPageData::try_from(data.as_ref()).unwrap();
         // println!("{:#04X?}", &index_data);
 
-        let target_data_loc = index_data.refno_locs.iter().find(|x| x.refno_0 == refno.get_0() && x.refno_1 == refno.get_1());
+        let target_data_loc = index_data
+            .refno_locs
+            .iter()
+            .find(|x| x.refno_0 == refno.get_0() && x.refno_1 == refno.get_1());
         // println!("{:#04X?}", &target_data_loc);
 
         if let Some(l) = target_data_loc {

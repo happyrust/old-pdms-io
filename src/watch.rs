@@ -128,7 +128,7 @@ impl PdmsWatcher {
             io.open()?;
             let basic_info = io.get_page_basic_info()?;
             // println!("basic info: {:#4X?}", &basic_info);
-            let new_ses_no = basic_info.latest_ses_pageno + 1;
+            let _new_ses_no = basic_info.latest_ses_pageno + 1;
             result.insert(path.as_ref().to_path_buf(), basic_info);
         }
 
