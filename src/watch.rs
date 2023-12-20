@@ -87,14 +87,13 @@ impl PdmsWatcher {
             }) {
                 let dir_entry = entry.unwrap();
                 let path = dir_entry.path();
-                //只处理0001 结尾的文件
                 let file_name = path.file_stem().unwrap().to_str().unwrap();
-                if path.is_dir() || !file_name.ends_with("0001"){
+                if path.is_dir(){
                     continue;
                 }
                 self.file_name_full_path_map.insert(file_name.to_owned(), path.to_path_buf());
                 let mut io = PdmsIO::new(path, true);
-                io.open()?;
+                io.open().unwrap();
                 if let Ok(basic_info) = io.get_page_basic_info() {
                     if let Some(old) = self.headers.get_mut(&path.to_path_buf()) {
                         //未发生修改，直接跳过
@@ -105,9 +104,10 @@ impl PdmsWatcher {
 
                 //初始化CBA的Archive文件，来保证后续增量下载
                 let input= path.to_path_buf();
-                let output: PathBuf = format!("{}/{}.cba", &cbas_dir_path, file_name).into();
+                let output: PathBuf = format!("{}/{}.cba", cbas_dir_path.as_str(), file_name).into();
+                let tmp_path = cbas_dir_path.clone();
                 join_set.spawn(async move {
-                    let compress_opt = CompressOptions::new(input, output);
+                    let compress_opt = CompressOptions::new(input, output, tmp_path.as_str());
                     execute_compress(compress_opt).await.unwrap();
                 });
             }
@@ -120,10 +120,10 @@ impl PdmsWatcher {
 
     ///扫描出来每个db文件的 header信息
     pub fn scan_db_headers<P: AsRef<Path>>(
-        paths: Vec<P>,
+        paths: &Vec<P>,
     ) -> anyhow::Result<IndexMap<PathBuf, DbPageBasicInfo>> {
         let mut result = IndexMap::new();
-        for path in &paths {
+        for path in paths {
             let mut io = PdmsIO::new(path, true);
             io.open()?;
             let basic_info = io.get_page_basic_info()?;

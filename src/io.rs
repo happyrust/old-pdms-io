@@ -112,20 +112,24 @@ impl PdmsIO {
         let session_addr = cur_page as u64 * 0x800;
         let mut cur_index_page = cur_ses_page.index_root_pageno;
         // let mut cur_index_addr = info.ses_start.index_root_pageno as u64 * 0x800;
-        let mut last_ses_page = cur_ses_page.last_ses_pageno;
-        // println!("Till pageno: {:#04X?}", till_pageno);
-        // println!("pageno: {:#04X}, index addr: ({:#04X}, {:#04X}), session addr: ({:#04X}, {:#04X})",
-        //          cur_page, cur_index_page, cur_index_page * 0x800,
-        //          session_addr, session_addr/0x800);
-        //查询到所有大于当前pageno的参考号，即是修改的参考号
-        let latest_index_page = self.read_index_data(cur_index_page)?;
-        //println!("{:#04X?}", &index_root_page);
-        let count = latest_index_page.index;
-        let mut i = 1;
+        let mut last_ses_page_no = cur_ses_page.last_ses_pageno;
+         //查询到所有大于当前pageno的参考号，即是修改的参考号
+         let latest_index_page = self.read_index_data(cur_index_page)?;
+        #[cfg(debug_assertions)]
+        {
+            println!("Till pageno: {:#04X?}", till_pageno);
+            println!("pageno: {:#04X}, index addr: ({:#04X}, {:#04X}), session addr: ({:#04X}, {:#04X})",
+                     cur_page, cur_index_page, cur_index_page * 0x800,
+                     session_addr, session_addr/0x800);
+            println!("{:#04X?}", &latest_index_page.level);
+        }
+        let count = latest_index_page.level;
+        let mut i = 0;
         let mut refno_data_offsets_map = BTreeMap::new();
         loop {
-            let offset_page = (cur_index_page - i);
-            // println!("offset_page: {:#04X}", offset_page);
+            let offset_page = cur_index_page - i;
+            #[cfg(debug_assertions)]
+            println!("offset_page: {:#04X}", offset_page);
             // let offset =  offset_page * 0x800;
             if let Some(till) = till_pageno {
                 //达到目标页，跳出循环
@@ -134,35 +138,42 @@ impl PdmsIO {
                     break;
                 }
             }
-            if let Ok(cur_index_page) = self.read_index_data(offset_page) {
-                // dbg!(&cur_index_page);
-                // dbg!(&last_ses_page);
+            if let Ok(cur_index_page_data) = self.read_index_data(offset_page) {
+                #[cfg(debug_assertions)]
+                {
+                    dbg!(&cur_index_page_data.level);
+                    dbg!(&last_ses_page_no);
+                }
+
                 //找到最近的索引
-                if cur_index_page.index == 0 {
+                if cur_index_page_data.level == 0 {
                     // println!("offset: ({:#04X?}, {:#04X?})", offset_page, offset_page * 0x800);
-                    let nearest_loc = cur_index_page
+                    cur_index_page_data
                         .refno_locs
                         .iter()
                         //todo 需要弄清楚 00 02 C9 59， 这里的00 02 是什么含义
                         .filter(|x| {
-                            x.page_no > last_ses_page && x.page_no < basic_info.pdms_header.page_no
+                            x.page_no > last_ses_page_no && x.page_no < basic_info.pdms_header.page_no
                         })
                         .for_each(|x| {
-                            // println!("Found loc: {:#04X?}", x);
+                            #[cfg(debug_assertions)]
+                            println!("Found loc: {:#04X?}", x);
                             let data_page_offset = x.page_no as u64 * 0x800;
                             let refno_att_offset = data_page_offset + x.offset as u64 * 2;
                             refno_data_offsets_map.insert(
                                 RefU64::from_two_nums(x.refno_0, x.refno_1),
                                 refno_att_offset,
                             );
-                            // println!("data_offset: {:#04X?}", refno_att_offset);
+                            #[cfg(debug_assertions)]
+                            println!("data_offset: {:#04X?}", refno_att_offset);
                         });
                 }
             } else {
                 let last_ses_pageno = cur_ses_page.last_ses_pageno;
                 cur_ses_page = self.read_ses_data(last_ses_pageno)?;
                 cur_index_page = cur_ses_page.index_root_pageno;
-                // println!("jump to index: {:#04X?}", cur_index_page);
+                #[cfg(debug_assertions)]
+                println!("jump to index: {:#04X?}", cur_index_page);
                 if till_pageno.is_some() {
                     //重置索引
                     i = 0;
@@ -287,13 +298,13 @@ impl PdmsIO {
         // println!("{:#04X?}", &target_data_loc);
 
         if let Some(l) = target_data_loc {
-            let loc = l.page_no * 0x800 + l.offset as u32 * 2;
+            let _loc = l.page_no * 0x800 + l.offset as u32 * 2;
             // println!("data loc {:#04X?}", loc);
             // let element = self.get_element( loc)?;
             // dbg!(&element);
         }
 
-        let upper_root_addr = u.page_no * 0x800;
+        let _upper_root_addr = u.page_no * 0x800;
         // println!("last index addr: {:#04X}", upper_root_addr);
 
         Ok(true)

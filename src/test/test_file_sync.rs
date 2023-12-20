@@ -35,7 +35,7 @@ pub async fn test_compress_file() {
     let output: PathBuf = format!("{}/{}.cba", &dir, "test1112").into();
     dbg!(&output);
     let mut time = Instant::now();
-    let compress_opt = CompressOptions::new(input, output);
+    let compress_opt = CompressOptions::new(input, output, &dir);
     // dbg!(&compress_opt);
     execute_compress(compress_opt).await.unwrap();
     println!("compress_archive cost: {:?}s", time.elapsed().as_secs_f64());

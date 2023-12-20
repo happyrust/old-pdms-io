@@ -2,6 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use blake2::{Blake2b512, Digest};
 use futures_util::{future, StreamExt};
 use log::*;
+use std::fs::create_dir_all;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::{collections::HashMap, time::Instant};
@@ -156,7 +157,7 @@ pub struct CompressOptions {
 }
 
 impl CompressOptions {
-    pub fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U) -> Self {
+    pub fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U, temp_dir: &str) -> Self {
         let mut filter_config = chunker::FilterConfig::default();
         let num_chunk_buffers: usize =
             match num_cpus::get() {
@@ -165,11 +166,15 @@ impl CompressOptions {
                 n => n * 2,
             };
         filter_config.window_size = 8;
-        let temp_file = output.as_ref().with_extension("tmp");
+        // let temp_file = output.as_ref().with_extension("tmp");
+        let output = output.as_ref().to_path_buf();
+        let file_name = output.file_stem().unwrap().to_str().unwrap();
+        let temp_file = format!("{temp_dir}/{}.tmp", file_name).into();
+        dbg!(&temp_file);
         Self {
             force_create: true,
             input: Some(input.as_ref().to_path_buf()),
-            output: output.as_ref().to_path_buf(),
+            output,
             temp_file,
             hash_length: 64,
             chunker_config: chunker::Config::BuzHash(filter_config),
@@ -280,10 +285,10 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
             opts.output.display()
         ))?;
     }
-    std::fs::remove_file(&opts.temp_file).context(format!(
-        "Failed to remove temporary file {}",
-        opts.temp_file.display()
-    ))?;
+    // std::fs::remove_file(&opts.temp_file).context(format!(
+    //     "Failed to remove temporary file {}",
+    //     opts.temp_file.display()
+    // ))?;
     drop(output_file);
     {
         // Print archive info

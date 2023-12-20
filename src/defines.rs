@@ -161,9 +161,11 @@ pub struct IndexPageData {
     pub page_type: i32,
     // #[deku(assert_eq = "0xCC47DF")]
     pub noun: i32,
+    //00 00 00 00 00 00 00 02 00 00 00 02 00 00 00 00
+    //00 00 00 01 00 00 00 02 00 00 00 02 00 00 00 00
     //00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00
     // #[deku(endian = "big")]
-    pub index: u32,
+    pub level: u32,
 
     pub unknowns: [u32; 3],
 
