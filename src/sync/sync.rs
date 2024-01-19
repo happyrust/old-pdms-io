@@ -19,7 +19,7 @@ pub async fn compress_archive<T: AsRef<Path>>(
         ..Default::default()
     };
     let mut input_file = File::from_std( std::fs::File::open(input).unwrap());
-    let mut force_create = true;
+    let force_create = true;
     let mut output_file = File::from_std(std::fs::OpenOptions::new()
         .write(true)
         .read(true)

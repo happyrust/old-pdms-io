@@ -32,7 +32,7 @@ impl PdmsIO {
     }
 
     pub fn open(&mut self) -> anyhow::Result<()> {
-        let mut file = File::options().read(self.readonly).open(&self.path)?;
+        let file = File::options().read(self.readonly).open(&self.path)?;
         self.file = Some(file);
         Ok(())
     }
@@ -58,7 +58,7 @@ impl PdmsIO {
         // println!("{:#04X?}", &pdms_header);
         let latest_ses_pageno = pdms_header.page_no;
         let latest_ses_data = self.read_ses_data(latest_ses_pageno)?;
-        let mut file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().unwrap();
         Ok(DbPageBasicInfo {
             pdms_header,
             latest_ses_pageno,
@@ -69,7 +69,7 @@ impl PdmsIO {
 
     #[inline]
     pub fn read_pdms_header(&mut self) -> anyhow::Result<PdmsHeader> {
-        let mut file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().unwrap();
         file.seek(SeekFrom::Start(0u64))?;
         let mut head_data = vec![];
         head_data.resize(size_of::<PdmsHeader>(), 0u8);
@@ -80,7 +80,7 @@ impl PdmsIO {
 
     #[inline]
     pub fn read_ses_data(&mut self, ses_pageno: u32) -> anyhow::Result<SessionPageData> {
-        let mut file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().unwrap();
         let mut ses_data = vec![];
         ses_data.resize(size_of::<SessionPageData>(), 0u8);
         file.seek(SeekFrom::Start(ses_pageno as u64 * 0x800))?;
@@ -91,7 +91,7 @@ impl PdmsIO {
 
     #[inline]
     pub fn read_index_data(&mut self, index_pageno: u32) -> anyhow::Result<IndexPageData> {
-        let mut file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().unwrap();
         let mut ses_data = vec![];
         ses_data.resize(0x800, 0u8);
         file.seek(SeekFrom::Start(index_pageno as u64 * 0x800))?;
@@ -106,13 +106,13 @@ impl PdmsIO {
         basic_info: &DbPageBasicInfo,
         till_pageno: Option<u32>,
     ) -> anyhow::Result<Vec<EleData>> {
-        let mut ses_info = self.get_page_basic_info()?;
+        let ses_info = self.get_page_basic_info()?;
         let mut cur_ses_page = ses_info.latest_ses_data.clone();
         let cur_page = ses_info.pdms_header.page_no;
         let session_addr = cur_page as u64 * 0x800;
         let mut cur_index_page = cur_ses_page.index_root_pageno;
         // let mut cur_index_addr = info.ses_start.index_root_pageno as u64 * 0x800;
-        let mut last_ses_page_no = cur_ses_page.last_ses_pageno;
+        let last_ses_page_no = cur_ses_page.last_ses_pageno;
          //查询到所有大于当前pageno的参考号，即是修改的参考号
          let latest_index_page = self.read_index_data(cur_index_page)?;
         #[cfg(debug_assertions)]
@@ -203,7 +203,7 @@ impl PdmsIO {
     }
 
     pub fn search_refno(&mut self, refno: RefU64) -> anyhow::Result<bool> {
-        let mut file = self.file.as_mut().unwrap();
+        let file = self.file.as_mut().unwrap();
         file.seek(SeekFrom::Start(0u64))?;
         let mut head_data = vec![];
         head_data.resize(size_of::<PdmsHeader>(), 0u8);

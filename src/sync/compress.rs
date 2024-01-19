@@ -187,7 +187,7 @@ impl CompressOptions {
 pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
     let chunker_config = opts.chunker_config.clone();
     let compression = opts.compression;
-    let mut time = Instant::now();
+    let time = Instant::now();
     let mut output_file = std::fs::OpenOptions::new()
         .write(true)
         .read(true)
