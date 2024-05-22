@@ -85,3 +85,4 @@ fn test_enum() {
     // let output: Vec<u8> = deku_test.try_into().unwrap();
     // assert_eq!(output, vec![2]);
 }
+

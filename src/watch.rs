@@ -60,13 +60,13 @@ impl PdmsWatcher {
         Ok(())
     }
 
-    pub fn load_from_json(path: Option<&str>) -> anyhow::Result<Self> {
-        let mut file = File::open(path.unwrap_or("watcher.json"))?;
-        let mut string = String::new();
-        file.read_to_string(&mut string)?;
-        let w = serde_json::from_str(string.as_str())?;
-        Ok(w)
-    }
+    // pub fn load_from_json(path: Option<&str>) -> anyhow::Result<Self> {
+    //     let mut file = File::open(path.unwrap_or("watcher.json"))?;
+    //     let mut string = String::new();
+    //     file.read_to_string(&mut string)?;
+    //     let w = serde_json::from_str(string.as_str())?;
+    //     Ok(w)
+    // }
 
     pub async fn init_local_watcher(&self) -> anyhow::Result<()> {
         for watch_dir in &self.watch_dirs {

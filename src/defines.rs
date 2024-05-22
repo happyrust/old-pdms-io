@@ -3,10 +3,11 @@ use deku::prelude::*;
 use std::convert::{TryFrom, TryInto};
 use deku::ctx::Endian;
 use serde::{Deserialize, Serialize};
+use derivative::Derivative;
 
 pub const PAGE_SIZE: usize = 0x800;
 
-// By default it uses the system endianness, but can be overwritten
+
 #[derive(Default, Clone, Debug, PartialEq, DekuRead, DekuWrite, Serialize, Deserialize)]
 #[deku(endian = "big")]
 pub struct PdmsHeader {
@@ -36,7 +37,7 @@ pub struct PdmsHeader {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct DbPageBasicInfo{
+pub struct DbPageBasicInfo {
     pub pdms_header: PdmsHeader,
     pub latest_ses_pageno: u32,
     pub latest_ses_data: SessionPageData,
@@ -47,11 +48,11 @@ pub struct DbPageBasicInfo{
 
 ///会话层的定位信息
 #[derive(Default, Clone, Debug, PartialEq, DekuRead, DekuWrite, Serialize, Deserialize)]
-#[deku(endian = "big")] // By default it uses the system endianness, but can be overwritten
+#[deku(endian = "big")]
 pub struct SessionPageData {
     pub page_type: i32,
-    pub last_ses_pageno: u32,
-    pub last_ses_extno: u32,
+    pub last_ses_pageno: i32,
+    pub last_ses_extno: i32,
     //会话id
     pub sesno: i32,
     pub unknown_0: i32,  // 0xFF FF FF FF
@@ -67,7 +68,7 @@ pub struct SessionPageData {
 
 ///内含有的几个index part，名称表等等
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-#[deku(endian = "big")] // By default it uses the system endianness, but can be overwritten
+#[deku(endian = "big")]
 pub struct SesIndexsData {
     #[deku(assert_eq = "0x3")]
     pub page_type: i32,
@@ -84,11 +85,10 @@ pub struct SesIndexsData {
     pub index_root_extno: u32,
     pub claim_root_pageno: u32,
     pub claim_root_extno: u32,
-
 }
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-#[deku(endian = "big")] // By default it uses the system endianness, but can be overwritten
+#[deku(endian = "big")]
 pub struct RefnoIndexPgId {
     pub refno_0: u32,
     pub refno_1: u32,
@@ -123,8 +123,8 @@ pub struct RootIndexPage {
 
 
 ///Index 里的数据条目
-#[derive(Debug, PartialEq, DekuRead, DekuWrite)]
-#[deku(endian = "big")] // By default it uses the system endianness, but can be overwritten
+#[derive(Debug, PartialEq, DekuRead, DekuWrite, Clone)]
+#[deku(endian = "big")]
 pub struct RefnoDataLoc {
     pub refno_0: u32,
     pub refno_1: u32,
@@ -134,6 +134,14 @@ pub struct RefnoDataLoc {
     #[deku(bits = "12")]
     pub other: u16,
 }
+
+impl RefnoDataLoc {
+    #[inline]
+    pub fn get_att_offset(&self) -> u64 {
+        self.page_no as u64 * 0x800 + self.offset as u64 * 2
+    }
+}
+
 
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
 pub struct RefnoIndexPage {
@@ -148,40 +156,49 @@ pub struct RefnoIndexPage {
     #[deku(endian = "big")]
     pub pfno: u32,   //还需要搞的清楚一点，这个值到底怎么来的
 
-    #[deku(reader = "read_refno_index_pgid(deku::rest)")]
+    #[deku(reader = "read_refno_index_pgid(deku::rest, )")]
     pub data_locs: Vec<RefnoIndexPgId>,
 
 }
 
 //DekuWrite
-#[derive(Debug, PartialEq, DekuRead)]
+#[derive(Derivative, PartialEq, DekuRead)]
+#[derivative(Debug)]
 #[deku(endian = "big")]
 pub struct IndexPageData {
-    // #[deku(endian = "big")]
     pub page_type: i32,
-    // #[deku(assert_eq = "0xCC47DF")]
+    #[deku(assert_eq = "0xCC47DF")]
     pub noun: i32,
-    //00 00 00 00 00 00 00 02 00 00 00 02 00 00 00 00
-    //00 00 00 01 00 00 00 02 00 00 00 02 00 00 00 00
-    //00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00
-    // #[deku(endian = "big")]
     pub level: u32,
-
     pub unknowns: [u32; 3],
+    pub pfno: u32,
 
-    // #[deku(endian = "big")]
-    pub pfno: u32,   //还需要搞的清楚一点，这个值到底怎么来的
-
-    #[deku(reader = "read_refno_data_loc(deku::rest)")]
+    #[deku(reader = "read_refno_data_loc(deku::rest, *level)")]
     pub refno_locs: Vec<RefnoDataLoc>,
-
+    #[derivative(Debug = "ignore")]
     #[deku(count = "deku::rest.len()/8")]
     pub remain_zero_bytes: Vec<u8>,   //剩余的余量bytes
 }
 
-fn read_refno_data_loc(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoDataLoc>), DekuError> {
+impl IndexPageData {
+    #[inline]
+    pub fn get_max_pgno(&self) -> u32 {
+        self.refno_locs.iter().map(|x| x.page_no).max().unwrap_or_default()
+    }
+}
+
+
+//如果 level 为 2，格式还有点不一样
+fn read_refno_data_loc(mut rest: &BitSlice<u8, Msb0>, level: u32) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoDataLoc>), DekuError> {
     let mut vec = Vec::new();
-    let mut rest = rest;
+    if level == 2 {
+        //4 个未知数
+        //80 00 00 01 80 00 00 01 00 00 7D 3E 00 00 00 01
+        rest = u32::read(rest, ())?.0;
+        rest = u32::read(rest, ())?.0;
+        rest = u32::read(rest, ())?.0;
+        rest = u32::read(rest, ())?.0;
+    }
     loop {
         let (next_rest, peek) = u32::read(rest, ())?;
         if peek == 0x0 {
@@ -195,7 +212,7 @@ fn read_refno_data_loc(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>
     Ok((rest, vec))
 }
 
-fn read_refno_index_pgid(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoIndexPgId>), DekuError> {
+fn read_refno_index_pgid(rest: &BitSlice<u8, Msb0>) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoIndexPgId>), DekuError> {
     let mut pgids = Vec::new();
     let mut rest = rest;
     loop {
@@ -224,7 +241,7 @@ pub struct EleMembers {
     pub refno: (u32, u32),
     #[deku(endian = "big")]
     pub unknown_0: (u32, u32),
-    #[deku(count="(len-4)/2")]
+    #[deku(count = "(len-4)/2")]
     #[deku(endian = "big")]
     pub children: Vec<(u32, u32)>,
 }
@@ -271,12 +288,10 @@ pub struct EleRawData {
     pub explicit_data: Option<Vec<u8>>,
 }
 
-impl EleRawData {
-
-}
+impl EleRawData {}
 
 
-fn read_members(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Option<EleMembers>), DekuError> {
+fn read_members(rest: &BitSlice<u8, Msb0>) -> Result<(&BitSlice<u8, Msb0>, Option<EleMembers>), DekuError> {
     let (_next_rest, peek) = u16::read(rest, Endian::Big)?;
     if peek != 0x2 {
         return Ok((rest, None));
@@ -285,7 +300,7 @@ fn read_members(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Optio
     Ok((next_rest, Some(membs)))
 }
 
-fn read_eles(rest:&BitSlice<u8, Msb0>,) -> Result<(&BitSlice<u8, Msb0>, Vec<EleRawData>), DekuError> {
+fn read_eles(rest: &BitSlice<u8, Msb0>) -> Result<(&BitSlice<u8, Msb0>, Vec<EleRawData>), DekuError> {
     let mut vec = Vec::new();
     let mut rest = rest;
     loop {
