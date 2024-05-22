@@ -1,6 +1,6 @@
 use aios_core::get_default_pdms_db_info;
 use aios_core::pdms_types::{PdmsElement, RefU64};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -19,6 +19,7 @@ pub struct PdmsIO {
     pub path: PathBuf,
     pub readonly: bool,
     pub file: Option<File>,
+    pub ses_data_map: HashMap<u32, SessionPageData>,
 }
 
 const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [0x00u8, 0x00, 0x00, 0x05, 0x00, 0xCC, 0x47, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
@@ -30,6 +31,7 @@ impl PdmsIO {
             path: path.as_ref().to_path_buf(),
             readonly,
             file: None,
+            ses_data_map: Default::default(),
         }
     }
 
@@ -121,9 +123,24 @@ impl PdmsIO {
         parse_ele_data(input).await
     }
 
+    #[inline]
     pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
         let loc = self.search_refno_pgno(refno)?;
         self.get_element(loc.get_att_offset()).await
+    }
+
+    pub async fn auto_get_elements_deep(&mut self, refno: RefU64) -> anyhow::Result<HashMap<RefU64, EleData>> {
+        let mut map = HashMap::new();
+        let mut pendings = VecDeque::new();
+        pendings.push_back(refno);
+        while let Some(refno) = pendings.pop_front() {
+            let ele = self.auto_get_element(refno).await?;
+            pendings.extend(&*ele.children);
+            map.insert(refno, ele);
+        }
+
+
+        Ok(map)
     }
 
     ///获得page的信息
@@ -131,7 +148,7 @@ impl PdmsIO {
         let pdms_header = self.read_pdms_header()?;
         // println!("{:#04X?}", &pdms_header);
         let latest_ses_pageno = pdms_header.page_no;
-        let latest_ses_data = self.read_ses_data(latest_ses_pageno)?;
+        let latest_ses_data = self.read_ses_data(latest_ses_pageno)?.clone();
         let file = self.get_file()?;
         Ok(DbPageBasicInfo {
             pdms_header,
@@ -152,16 +169,20 @@ impl PdmsIO {
         Ok(pdms_header)
     }
 
-    //todo 增加缓存
+    ///读取ses data
     #[inline]
-    pub fn read_ses_data(&mut self, ses_pageno: u32) -> anyhow::Result<SessionPageData> {
-        let file = self.get_file()?;
-        let mut ses_data = vec![];
-        ses_data.resize(size_of::<SessionPageData>(), 0u8);
-        file.seek(SeekFrom::Start(ses_pageno as u64 * 0x800))?;
-        file.read_exact(&mut ses_data)?;
-        let ses_page_data = SessionPageData::try_from(ses_data.as_ref())?;
-        Ok(ses_page_data)
+    pub fn read_ses_data(&mut self, ses_pgno: u32) -> anyhow::Result<&SessionPageData> {
+        if !self.ses_data_map.contains_key(&ses_pgno){
+            let file = self.get_file()?;
+            let mut ses_data = vec![];
+            ses_data.resize(size_of::<SessionPageData>(), 0u8);
+            file.seek(SeekFrom::Start(ses_pgno as u64 * 0x800))?;
+            file.read_exact(&mut ses_data)?;
+            if let Ok(s) = SessionPageData::try_from(ses_data.as_ref())  {
+                self.ses_data_map.insert(ses_pgno, s);
+            }
+        }
+        return self.ses_data_map.get(&ses_pgno).ok_or(anyhow!("Can't read ses page with {ses_pgno}."));
     }
 
     #[inline]
@@ -178,7 +199,6 @@ impl PdmsIO {
     //直接读取中间这段数据的att index table，直接获取所有需要的数据
     pub async fn collect_increment_eles(
         &mut self,
-        basic_info: &DbPageBasicInfo,
         till_pageno: u32,
     ) -> anyhow::Result<HashMap<RefU64, EleData>> {
         let mut file = self.get_file()?;
@@ -212,114 +232,6 @@ impl PdmsIO {
                     );
                 }
             }
-        }
-
-        let mut eles_map = HashMap::new();
-        for (refno, offset) in refno_data_offsets_map {
-            match self.get_element(offset).await {
-                Ok(ele) => {
-                    eles_map.insert(ele.refno, ele);
-                }
-                Err(e) => {
-                    #[cfg(feature = "debug_parse")]
-                    {
-                        dbg!((refno, offset, e));
-                    }
-                }
-            }
-        }
-        Ok(eles_map)
-    }
-
-    ///收集发生修改的参考号直到某个pageno为止,
-    pub async fn collect_increment_eles_old(
-        &mut self,
-        basic_info: &DbPageBasicInfo,
-        till_pageno: Option<u32>,
-    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
-        let ses_info = self.get_page_basic_info()?;
-        // #[cfg(feature = "debug_parse")]
-        // dbg!(&ses_info);
-        let mut cur_ses_page = ses_info.latest_ses_data.clone();
-        let cur_page = ses_info.pdms_header.page_no;
-        let session_addr = cur_page as u64 * 0x800;
-        let mut cur_index_page = cur_ses_page.index_root_pageno;
-        let mut last_ses_page_no = cur_ses_page.last_ses_pageno.max(0);
-        //查询到所有大于当前pageno的参考号，即是修改的参考号
-        let latest_index_page = self.read_index_data(cur_index_page)?;
-        #[cfg(feature = "debug_parse")]
-        {
-            println!("Till pageno: {:#04X?}", till_pageno);
-            println!("pageno: {:#04X}, index addr: ({:#04X}, {:#04X}), session addr: ({:#04X}, {:#04X})",
-                     cur_page, cur_index_page, cur_index_page * 0x800,
-                     session_addr / 0x800, session_addr);
-            println!("latest_index_page.level: {:#04X?}", &latest_index_page.level);
-            dbg!(&last_ses_page_no);
-        }
-        let count = latest_index_page.level;
-        let mut i = 0;
-        let mut refno_data_offsets_map = BTreeMap::new();
-        //找到所有的index page，只保留这个范围的数据更新, 如果不是index page，直接跳过
-        //是否应该从2开头的index page获得目标，而不是一直这样往上找？
-        //如果找到了已经存在的参考号？
-        //file index version的确定是不是要从数据库里保存，然后做对比
-        //index 的信息是否要保存？
-        loop {
-            let offset_page = cur_index_page - i;
-            #[cfg(feature = "debug_parse")]
-            println!("offset_page: {:#04X}", offset_page);
-            // let offset =  offset_page * 0x800;
-            //从后往前的扫描
-            if let Some(till) = till_pageno {
-                //达到目标页，跳出循环
-                if offset_page <= till {
-                    #[cfg(feature = "debug_parse")]
-                    println!("Scan to {:#04X} end.", till);
-                    break;
-                }
-            }
-            if let Ok(cur_index_page_data) = self.read_index_data(offset_page) {
-                // #[cfg(feature = "debug_parse")]
-                // {
-                //     dbg!(&cur_index_page_data.level);
-                // }
-                //找到最近的索引
-                if cur_index_page_data.level == 0 {
-                    // println!("offset: ({:#04X?}, {:#04X?})", offset_page, offset_page * 0x800);
-                    cur_index_page_data
-                        .refno_locs
-                        .iter()
-                        //todo 需要弄清楚 00 02 C9 59， 这里的00 02 是什么含义
-                        .filter(|x| {
-                            x.page_no > last_ses_page_no as _
-                                && x.page_no < basic_info.pdms_header.page_no
-                                && x.page_no > till_pageno.unwrap_or(0)
-                        })
-                        .for_each(|x| {
-                            let refno_att_offset = x.get_att_offset();
-                            #[cfg(feature = "debug_parse")]
-                            println!("Found loc: {:#04X?}, att_offset: {:#04X}", x, refno_att_offset);
-                            refno_data_offsets_map.insert(
-                                RefU64::from_two_nums(x.refno_0, x.refno_1),
-                                refno_att_offset,
-                            );
-                        });
-                }
-            } else {
-                let last_ses_pageno = cur_ses_page.last_ses_pageno as _;
-                cur_ses_page = self.read_ses_data(last_ses_pageno)?;
-                cur_index_page = cur_ses_page.index_root_pageno;
-                #[cfg(feature = "debug_parse")]
-                println!("jump to index: {:#04X?}", cur_index_page);
-                if till_pageno.is_some() {
-                    //重置索引
-                    i = 0;
-                    continue;
-                } else {
-                    break;
-                }
-            }
-            i += 1;
         }
 
         let mut eles_map = HashMap::new();
