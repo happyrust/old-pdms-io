@@ -20,20 +20,6 @@ pub struct PdmsHeader {
     pub page_no: u32,
     pub ext_no: u32,
 
-    // field_a: u8,
-    // #[deku(bits = "7")]
-    // field_b: u8,
-    // #[deku(bits = "1")]
-    // field_c: u8,
-    // #[deku(endian = "big")]
-    // field_d: u16,
-    // #[deku(bits = "2")]
-    // field_e: u8,
-    // field_f: FieldF,
-    // num_items: u8,
-    // #[deku(count = "num_items", endian = "big")]
-    // items: Vec<u16>,
-    // array: [i32; 1],
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -69,7 +55,7 @@ pub struct SessionPageData {
 ///内含有的几个index part，名称表等等
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
 #[deku(endian = "big")]
-pub struct SesIndexsData {
+pub struct SesIndexesData {
     #[deku(assert_eq = "0x3")]
     pub page_type: i32,
     pub last_ses_pageno: u32,

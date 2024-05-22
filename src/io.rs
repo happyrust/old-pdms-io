@@ -64,31 +64,38 @@ impl PdmsIO {
         Ok(max_pgno)
     }
 
-    //todo 可以提前加载一些索引结构
+    //todo 可以提前加载一些索引结构, 加载成BTree，可以很快的定位到page
     pub fn search_refno_pgno(&mut self, refno: RefU64) -> anyhow::Result<RefnoDataLoc> {
         let basic_info = self.get_page_basic_info()?;
-        let mut file = self.get_file()?;
         let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
-        // dbg!(latest_index_pgno);
         let mut index_data = self.read_index_data(latest_index_pgno)?;
         let mut level = index_data.level as i32;
         let r0 = refno.get_0();
         let r1 = refno.get_1();
-        // println!("({:#4X}, {:#4X})", r0, r1);
+        // println!("Target: ({:#4X}, {:#4X}), latest index pgno: {:#4X}", r0, r1, latest_index_pgno);
         while level >= 0 {
             // dbg!(&index_data.refno_locs);
-            let mut next_loc_index = index_data.refno_locs.windows(2).position(
-                |x| (x[1].refno_0 >= r0 && x[0].refno_0 < r0)   //r0的范围找到后，可以停止
-                    || (
-                    (r0 >= x[0].refno_0 && r1 >= x[0].refno_1)
-                        && (r0 <= x[1].refno_0 && r1 < x[1].refno_1)
+            let mut next_loc_index = if level == 0{
+                index_data.refno_locs.iter().position(|x| x.refno_0==r0 && x.refno_1==r1)
+            } else {
+                index_data.refno_locs.windows(2).position(
+                    |x| (x[1].refno_0 > r0 && x[0].refno_0 <= r0)   //r0的范围找到后，可以停止
+                        || (
+                        (r0 >= x[0].refno_0 && r1 >= x[0].refno_1)
+                            && (r0 <= x[1].refno_0 && r1 < x[1].refno_1)
+                    )
                 )
-            ).unwrap_or(index_data.refno_locs.len() - 1);
+            };
+            if level == 0 && next_loc_index.is_none(){
+                break;
+            }
+            let indx = next_loc_index.unwrap_or(index_data.refno_locs.len() - 1);
             // dbg!(next_loc_index);
-            let d = index_data.refno_locs[next_loc_index].clone();
+            let d = index_data.refno_locs[indx].clone();
             let next_pgno = d.page_no;
             // println!("index level {level}, next_pgno is {:#4X}", next_pgno);
             if level == 0 {
+                // println!("index level {level}, found pgno is {:#4X}", next_pgno);
                 return Ok(d);
             }else{
                 index_data = self.read_index_data(next_pgno)?;
@@ -98,32 +105,6 @@ impl PdmsIO {
 
         Err(anyhow!("Can't find the att pos loc"))
     }
-
-    //获得当前文件最大的att pgno
-    // pub fn get_att_max_pgno(&mut self) -> anyhow::Result<u32> {
-    //     //先暂时这么做
-    //     let basic_info = self.get_page_basic_info()?;
-    //     let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
-    //     let mut index_data = self.read_index_data(latest_index_pgno)?;
-    //     let mut max_pgno  = 0;
-    //     // dbg!(&index_data);
-    //     //索引层级按次序依次下去找
-    //     if index_data.level == 2 {
-    //         max_pgno = index_data.get_max_pgno();
-    //         index_data = self.read_index_data(max_pgno)?;
-    //     }
-    //     // dbg!(&index_data);
-    //     if index_data.level == 1 {
-    //         max_pgno = index_data.get_max_pgno();
-    //         index_data = self.read_index_data(max_pgno)?;
-    //     }
-    //     if index_data.level != 0 {
-    //         return Err(anyhow!("Not found leaf index page."));
-    //     }
-    //     // dbg!(&index_data);
-    //     max_pgno = index_data.get_max_pgno();
-    //     Ok(max_pgno)
-    // }
 
     ///获取单个element数据
     pub async fn get_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
@@ -138,6 +119,11 @@ impl PdmsIO {
             &data[..]
         };
         parse_ele_data(input).await
+    }
+
+    pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
+        let loc = self.search_refno_pgno(refno)?;
+        self.get_element(loc.get_att_offset()).await
     }
 
     ///获得page的信息
@@ -166,6 +152,7 @@ impl PdmsIO {
         Ok(pdms_header)
     }
 
+    //todo 增加缓存
     #[inline]
     pub fn read_ses_data(&mut self, ses_pageno: u32) -> anyhow::Result<SessionPageData> {
         let file = self.get_file()?;
@@ -178,11 +165,11 @@ impl PdmsIO {
     }
 
     #[inline]
-    pub fn read_index_data(&mut self, index_pageno: u32) -> anyhow::Result<IndexPageData> {
+    pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<IndexPageData> {
         let file = self.get_file()?;
         let mut ses_data = vec![];
         ses_data.resize(0x800, 0u8);
-        file.seek(SeekFrom::Start(index_pageno as u64 * 0x800))?;
+        file.seek(SeekFrom::Start(index_pgno as u64 * 0x800))?;
         file.read_exact(&mut ses_data)?;
         let ses_page_data = IndexPageData::try_from(ses_data.as_ref())?;
         Ok(ses_page_data)
