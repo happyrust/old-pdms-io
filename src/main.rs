@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     let db_paths = collect_db_dirs(
         &db_option.project_path,
         db_option.included_projects.iter().map(|x| x.as_ref()),
-    );
+    )?;
     dbg!(&db_paths);
     let json_path = format!("{}/watcher.json", db_option.project_path);
     let mut watcher = PdmsWatcher::new(db_paths);

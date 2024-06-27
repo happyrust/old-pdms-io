@@ -9,10 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::anyhow;
 use memchr::memmem::rfind_iter;
-// use crate::common::get_parsed_data;
-use crate::defines::{DbPageBasicInfo, IndexPageData, PdmsHeader, RefnoDataLoc, RefnoIndexPage, RootIndexPage, SessionPageData};
-use parse_pdms_db::parse::EleData;
-use parse_pdms_db::parse::{parse_attr_members, parse_ele_data, parse_ele_membs};
+use crate::defines::*;
+use parse_pdms::EleData;
+use parse_pdms::parse::*;
 
 #[derive(Debug)]
 pub struct PdmsIO {
@@ -123,6 +122,7 @@ impl PdmsIO {
         parse_ele_data(input).await
     }
 
+    //TODO 做一个不处理UDA的方法
     #[inline]
     pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
         let loc = self.search_refno_pgno(refno)?;
@@ -138,8 +138,6 @@ impl PdmsIO {
             pendings.extend(&*ele.children);
             map.insert(refno, ele);
         }
-
-
         Ok(map)
     }
 
