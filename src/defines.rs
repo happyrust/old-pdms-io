@@ -97,7 +97,7 @@ impl SessionPageData {
         //去掉后面为 0 的 bytes
         let i = (self.name_words_len as usize - 1) * 4;
         // dbg!(&self.name_bytes[i as usize..]);
-        let rpos = self.name_bytes[i..].into_iter().rev().rposition(|&x| x != 0).unwrap_or(0);
+        let rpos = self.name_bytes[i..].into_iter().rev().position(|&x| x != 0).unwrap_or(0);
         // dbg!(rpos);
         decode_chars_data(&self.name_bytes[..(i+4-rpos)]).0
     }
