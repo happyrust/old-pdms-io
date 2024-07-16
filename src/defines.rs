@@ -1,6 +1,8 @@
 use deku::bitvec::*;
 use deku::prelude::*;
 use std::convert::{TryFrom, TryInto};
+use aios_core::tool::db_tool::decode_chars_data;
+use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
 use deku::ctx::Endian;
 use serde::{Deserialize, Serialize};
 use derivative::Derivative;
@@ -43,13 +45,76 @@ pub struct SessionPageData {
     pub sesno: i32,
     pub unknown_0: i32,  // 0xFF FF FF FF
 
-    pub cur_ses_pageno: u32,
-    pub cur_ses_extno: u32,
+    pub cur_claim_pageno: u32,
+    pub cur_claim_extno: u32,
 
     pub index_root_pageno: u32,
     pub index_root_extno: u32,
-    pub claim_root_pageno: u32,
-    pub claim_root_extno: u32,
+    pub last_claim_pageno: u32,
+    pub last_claim_extno: u32,
+
+    pub unknown_1: i32,
+    pub unknown_2: i32,
+
+    pub year: u32,
+    pub month: u32,
+    pub hours: u32,
+    pub seconds: u32,
+
+    pub unknown_u32: [i32; 13],
+    pub name_words_len: u32,
+    #[deku(count = "name_words_len * 4")]
+    pub name_bytes: Vec<u8>,
+    #[deku(count = "(9 - name_words_len) * 4")]
+    pub empty_bytes: Vec<u8>,
+
+    pub comments_words_len: u32,
+    #[deku(count = "comments_words_len * 4")]
+    pub comments_bytes: Vec<u8>,
+
+    #[deku(count = "deku::rest.len()/8")]
+    pub remain_bytes: Vec<u8>,   //剩余的余量bytes
+}
+
+impl SessionPageData {
+    #[inline]
+    pub fn get_timestamp(&self) -> MappedLocalTime<DateTime<Utc>> {
+        let year = self.year;
+        let month = self.month;
+        let days = self.hours / 24;
+        let hours = self.hours % 24;
+        let minutes = self.seconds / 60;
+        let seconds = self.seconds % 60;
+        Utc.with_ymd_and_hms(year as i32, month as u32, days, hours as u32, minutes, seconds)
+    }
+
+
+    #[inline]
+    pub fn get_computer_name(&self) -> String {
+        if self.name_words_len == 0 {
+            return String::new();
+        }
+        //去掉后面为 0 的 bytes
+        let i = (self.name_words_len as usize - 1) * 4;
+        // dbg!(&self.name_bytes[i as usize..]);
+        let rpos = self.name_bytes[i..].into_iter().rev().rposition(|&x| x != 0).unwrap_or(0);
+        // dbg!(rpos);
+        decode_chars_data(&self.name_bytes[..(i+4-rpos)]).0
+    }
+
+    #[inline]
+    pub fn get_comments_name(&self) -> String {
+        if self.comments_words_len == 0 {
+            return String::new();
+        }
+        //去掉后面为 0 的 bytes
+        let i = (self.comments_words_len as usize - 1) * 4;
+        // dbg!(&self.comments_bytes[i as usize..]);
+        let rpos = self.comments_bytes[i..].into_iter().rev().position(|&x| x != 0).unwrap_or(0);
+        // dbg!(rpos);
+        decode_chars_data(&self.comments_bytes[..(i+4-rpos)]).0
+    }
+
 }
 
 ///内含有的几个index part，名称表等等

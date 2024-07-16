@@ -1,3 +1,5 @@
+#[allow(warnings)]
+
 use aios_core::file_helper::collect_db_dirs;
 use aios_core::get_db_option;
 use aios_core::pdms_types::RefU64;

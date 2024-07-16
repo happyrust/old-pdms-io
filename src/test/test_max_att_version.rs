@@ -4,6 +4,7 @@ use crate::io::PdmsIO;
 
 
 
+//讲session 数据保存到数据库中，后面版本更新比较的就是会话层的数据
 #[test]
 pub fn test_get_max_att_pgno() {
     let db_option = get_db_option();
@@ -17,7 +18,7 @@ pub fn test_get_max_att_pgno() {
     dbg!(&dir);
     // let db_path = dir.join("/ams000/ams1112_0001");
     // dbg!(&db_path);
-    let db_path = "D:/AVEVA/Projects/E3D2.1/AvevaMarineSample/ams000/ams1112_0001";
+    let db_path = "/Users/dongpengcheng/Documents/models/e3d_models/AvevaMarineSample/ams000/ams1112_0001";
     let mut io = PdmsIO::new(db_path, true);
     let max_att_version = io.get_att_latest_pgno().unwrap();
     dbg!(max_att_version);
