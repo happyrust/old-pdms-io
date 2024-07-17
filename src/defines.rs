@@ -19,7 +19,7 @@ pub struct PdmsHeader {
     pub unknown_1: [i32; 5],  //然后是 00 00 00 01
     pub noun: i32,
     pub unknown_2: i32, // 0xFF FF FF FF
-    pub page_no: u32,
+    pub latest_ses_pgno: u32,
     pub ext_no: u32,
 
 }
@@ -45,8 +45,9 @@ pub struct SessionPageData {
     pub sesno: i32,
     pub unknown_0: i32,  // 0xFF FF FF FF
 
-    pub cur_claim_pageno: u32,
-    pub cur_claim_extno: u32,
+    //最后一页的页号
+    pub end_pgno: u32,
+    pub end_extno: u32,
 
     pub index_root_pageno: u32,
     pub index_root_extno: u32,
@@ -77,15 +78,31 @@ pub struct SessionPageData {
 }
 
 impl SessionPageData {
+
+    pub fn gen_sur_json(&self, project: &str, dbnum: i32) -> String{
+        //id 需要拿 sesno 和 dbnum 组合？还是和文件名组合？
+        let id = format!("{}_{}_{}", project, dbnum, self.sesno);
+        let mut json = serde_json::json!({
+            "id": id,
+            "sesno": self.sesno,
+            "dbnum": dbnum,
+            "end_pgno": self.end_pgno,
+            "computer_name": self.get_computer_name(),
+            "comments": self.get_comments_name(),
+            "date": self.get_timestamp().to_string(),
+        });
+        json.to_string()
+    }
+
     #[inline]
-    pub fn get_timestamp(&self) -> MappedLocalTime<DateTime<Utc>> {
+    pub fn get_timestamp(&self) -> DateTime<Utc> {
         let year = self.year;
         let month = self.month;
         let days = self.hours / 24;
         let hours = self.hours % 24;
         let minutes = self.seconds / 60;
         let seconds = self.seconds % 60;
-        Utc.with_ymd_and_hms(year as i32, month as u32, days, hours as u32, minutes, seconds)
+        Utc.with_ymd_and_hms(year as i32, month as u32, days, hours as u32, minutes, seconds).latest().unwrap()
     }
 
 
@@ -113,6 +130,11 @@ impl SessionPageData {
         let rpos = self.comments_bytes[i..].into_iter().rev().position(|&x| x != 0).unwrap_or(0);
         // dbg!(rpos);
         decode_chars_data(&self.comments_bytes[..(i+4-rpos)]).0
+    }
+
+    //是否需要要检测有无变化？先拿到最新的数据试试看里面的参考号，和之前的比有无变化
+    pub fn get_session_saved_refnos() {
+
     }
 
 }

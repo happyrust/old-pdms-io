@@ -710,7 +710,9 @@ name = "bevy_tasks"
 version = "0.15.0-dev"
 dependencies = [
  "async-executor",
+ "futures-channel",
  "futures-lite 2.3.0",
+ "pin-project",
  "wasm-bindgen-futures",
 ]
 

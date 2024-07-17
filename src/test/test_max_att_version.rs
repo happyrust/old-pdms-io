@@ -19,7 +19,7 @@ pub fn test_get_max_att_pgno() {
     // let db_path = dir.join("/ams000/ams1112_0001");
     // dbg!(&db_path);
     let db_path = "/Users/dongpengcheng/Documents/models/e3d_models/AvevaMarineSample/ams000/ams1112_0001";
-    let mut io = PdmsIO::new(db_path, true);
+    let mut io = PdmsIO::new("ams", db_path, true);
     let max_att_version = io.get_att_latest_pgno().unwrap();
     dbg!(max_att_version);
 }

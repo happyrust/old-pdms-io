@@ -1,4 +1,4 @@
-use aios_core::get_default_pdms_db_info;
+use aios_core::{get_default_pdms_db_info, SUL_DB};
 use aios_core::pdms_types::{PdmsElement, RefU64};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
@@ -14,18 +14,32 @@ use parse_pdms_db::parse::*;
 
 #[derive(Debug)]
 pub struct PdmsIO {
+    pub project: String,
     pub path: PathBuf,
     pub readonly: bool,
     pub file: Option<File>,
     pub ses_data_map: HashMap<u32, SessionPageData>,
 }
 
+impl PdmsIO {
+    #[inline]
+    pub fn read_bytes(&mut self, offset: u32, len: i32) -> anyhow::Result<Vec<u8>> {
+        let file = self.get_file()?;
+        let mut data = vec![];
+        data.resize(len as usize, 0u8);
+        file.seek(SeekFrom::Start(offset as u64))?;
+        file.read_exact(&mut data)?;
+        Ok(data)
+    }
+}
+
 const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [0x00u8, 0x00, 0x00, 0x05, 0x00, 0xCC, 0x47, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
 
 impl PdmsIO {
     ///新建一个PdmsIO
-    pub fn new<P: AsRef<Path>>(path: P, readonly: bool) -> Self {
+    pub fn new<P: AsRef<Path>>(project: impl ToString, path: P, readonly: bool) -> Self {
         Self {
+            project: project.to_string(),
             path: path.as_ref().to_path_buf(),
             readonly,
             file: None,
@@ -45,6 +59,8 @@ impl PdmsIO {
         }
         Ok(self.file.as_mut().unwrap())
     }
+
+    //todo 修改这里的每次都要读完的限制, read_to_end
     pub fn get_att_latest_pgno(&mut self) -> anyhow::Result<u32> {
         let mut file = self.get_file()?;
         let mut input = vec![];
@@ -65,16 +81,14 @@ impl PdmsIO {
     }
 
     //todo 可以提前加载一些索引结构, 加载成BTree，可以很快的定位到page
+    //todo 改成 search all ？是否需要根据参考号的某个属性来判断？
     pub fn search_refno_pgno(&mut self, refno: RefU64) -> anyhow::Result<RefnoDataLoc> {
         let basic_info = self.get_page_basic_info()?;
         let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
         let mut index_data = self.read_index_data(latest_index_pgno)?;
         let mut level = index_data.level as i32;
-        let r0 = refno.get_0();
-        let r1 = refno.get_1();
-        // println!("Target: ({:#4X}, {:#4X}), latest index pgno: {:#4X}", r0, r1, latest_index_pgno);
+        let (r0, r1) = (refno.get_0(), refno.get_1());
         while level >= 0 {
-            // dbg!(&index_data.refno_locs);
             let mut next_loc_index = if level == 0{
                 index_data.refno_locs.iter().position(|x| x.refno_0==r0 && x.refno_1==r1)
             } else {
@@ -144,7 +158,7 @@ impl PdmsIO {
     pub fn get_page_basic_info(&mut self) -> anyhow::Result<DbPageBasicInfo> {
         let pdms_header = self.read_pdms_header()?;
         // println!("{:#04X?}", &pdms_header);
-        let latest_ses_pageno = pdms_header.page_no;
+        let latest_ses_pageno = pdms_header.latest_ses_pgno;
         let latest_ses_data = self.read_ses_data(latest_ses_pageno)?.clone();
         let file = self.get_file()?;
         Ok(DbPageBasicInfo {
@@ -193,6 +207,113 @@ impl PdmsIO {
         Ok(ses_page_data)
     }
 
+    ///指定 refno，收集它的历史数据
+    pub fn collect_ele_history(&self, refno: RefU64) -> Vec<EleData>{
+        let mut eles = vec![];
+        //根据参考号的pgno，快速找到 sesno -> pgno 的映射
+        //提前在 surreal 里存储？还是手动去搜索所有的 refno 数据
+
+        eles
+    }
+
+    pub async fn save_sessions_to_db(&mut self) -> anyhow::Result<()>{
+        let pdms_header = self.read_pdms_header().unwrap();
+        let mut cur_ses_pgno = pdms_header.latest_ses_pgno;
+        let project = self.project.clone();
+
+        //显示出有哪些修改，使用 json diff 工具
+        while cur_ses_pgno >= 4 {
+            //数据还是跟 pgno ?
+            // let all_ents_in_ses = self.collect_eles_in_session(cur_ses_pgno as _).await;
+            //历史数据是否需要存储的问题？
+            // dbg!(&all_ents_in_ses);
+
+            let cur_ses_page  = self.read_ses_data(cur_ses_pgno as _).unwrap();
+            //先保存 session 数据到数据库
+            let sql = format!("insert into e3d_ses {}",
+                              cur_ses_page.gen_sur_json(project.as_str(), pdms_header.db_num)
+            );
+            //执行 sql
+            SUL_DB.query(&sql).await.unwrap();
+
+
+
+            // let offset = cur_ses_page.end_pgno * 0x800 + 0x4;
+            // let bytes = io.read_bytes(offset, 4).unwrap();
+            // let type_name = db1_dehash(u32::from_be_bytes(bytes.try_into().unwrap()));
+            // dbg!(type_name);
+            // println!("session pgno {:#4X}: {:#4X}", cur_ses_pgno, offset / 0x800);
+            // dbg!((cur_ses_no, offset));
+            if cur_ses_page.last_ses_pageno < 0{
+                break;
+            }
+            cur_ses_pgno = cur_ses_page.last_ses_pageno as _;
+            // dbg!(last_ses_no);
+            // dbg!(cur_ses_page.get_timestamp());
+            // dbg!(cur_ses_page.get_computer_name());
+            // dbg!(cur_ses_page.get_comments_name());
+        }
+        Ok(())
+    }
+
+    //todo 对比两个 session，发生了哪些变化
+    //old, new
+    pub async fn compare_eles_between_sessions() {
+
+    }
+
+    pub async fn collect_eles_in_session(&mut self, ses_pgno: u32) -> Vec<EleData>{
+        let mut eles = vec![];
+        //读取当前会话层有多少属性保存了，是否需要读取 index 数据，然后开始读取属性数据
+        //过滤 index 里面的 pgno 大于当前会话的 pgno 的数据
+        let (cur_end_pgno, last_ses_pageno, index_root_pageno) = {
+            let d = self.read_ses_data(ses_pgno).unwrap();
+            (d.end_pgno, d.last_ses_pageno, d.index_root_pageno)
+        };
+        //读取上一个ses_data
+        let last_end_pgno = {
+            let d = self.read_ses_data(last_ses_pageno as u32).unwrap();
+            d.end_pgno
+        };
+        // dbg!((last_end_pgno, cur_end_pgno));
+        //只要过滤所有 last_end_pgno 比这个大，比 cur_end_pgno 小的参考号即可
+        //过滤 index page data 里面的数据
+        let mut index_data = self.read_index_data(index_root_pageno).unwrap();
+        // dbg!(index_data.level);
+        let mut final_locs = vec![];
+        self.filter_index_data(&index_data, &mut final_locs, last_end_pgno, cur_end_pgno);
+
+        // dbg!(&locs);
+        // //根据这个RefnoDataLoc 读取到所有发生更新的 index 数据
+        for loc in final_locs {
+            let ele = self.get_element(loc.get_att_offset()).await.unwrap();
+            eles.push(ele);
+            // dbg!(&loc);
+        }
+
+
+        eles
+    }
+
+    //递归的写法去读取
+    pub fn filter_index_data(&mut self, index_data: &IndexPageData, result_locs: &mut Vec<RefnoDataLoc>, last_end_pgno: u32, cur_end_pgno: u32) {
+        let mut level = index_data.level as i32;
+        let cur_locs = index_data.refno_locs.iter()
+            .filter(|x| x.page_no > last_end_pgno && x.page_no < cur_end_pgno)
+            .map(|x| x.clone())
+            .collect::<Vec<_>>();
+        // dbg!(level);
+        if level == 0 {
+            result_locs.extend(cur_locs);
+        }else{
+            for l in cur_locs{
+                let next_index_data = self.read_index_data(l.page_no).unwrap();
+                self.filter_index_data(&next_index_data, result_locs, last_end_pgno, cur_end_pgno);
+            }
+        }
+    }
+
+
     //直接读取中间这段数据的att index table，直接获取所有需要的数据
     pub async fn collect_increment_eles(
         &mut self,
@@ -205,7 +326,6 @@ impl PdmsIO {
         println!("Bytes start at : {:#04X?}", start);
         file.seek(SeekFrom::Start(start)).expect("collect_increment_eles");
         file.read_to_end(&mut input)?;
-        // let file_max_pgno = basic_info.latest_ses_data.index_root_pageno;
         let mut pos_iter = rfind_iter(&input, &REFNO_LEAF_INDEX_PAGE[..]);
         // let mut max_pgno = 0;
         let mut refno_data_offsets_map = BTreeMap::new();
@@ -258,7 +378,7 @@ impl PdmsIO {
         let pdms_header = PdmsHeader::try_from(head_data.as_ref()).unwrap();
         // println!("{:#04X?}", &pdms_header);
 
-        let ses_addr = pdms_header.page_no * 0x800;
+        let ses_addr = pdms_header.latest_ses_pgno * 0x800;
         // println!("Ses addr: {:#04X}", ses_addr);
 
         let mut ses_data = vec![];

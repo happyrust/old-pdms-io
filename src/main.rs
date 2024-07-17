@@ -25,7 +25,7 @@ fn test_read_eles() -> anyhow::Result<()> {
     // let mut watch_files: Vec<PathBuf> = Vec::new();
     // watch_files.push(r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000"#.into());
     let db_filepath = r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams1112_0001"#;
-    let mut io = PdmsIO::new(db_filepath.clone(), true);
+    let mut io = PdmsIO::new("ams", db_filepath.clone(), true);
     io.open()?;
     // io.collect_increment_eles(None);
     // io.search_refno(RefU64::from_refno_str("17496/184133").unwrap())?;
@@ -64,7 +64,7 @@ pub fn test_write() -> anyhow::Result<()> {
     // let mut head = EleHeaderData::try_from(head_data)?;
     // println!("head: {:#4X?}",&head);
 
-    let mut io = PdmsIO::new("pdms-test-data/sam7200_0001_back", true);
+    let mut io = PdmsIO::new("ams", "pdms-test-data/sam7200_0001_back", true);
     let basic_info = io.get_page_basic_info()?;
     // println!("basic info: {:#4X?}",&basic_info);
     let new_ses_no = basic_info.latest_ses_pageno + 1;
