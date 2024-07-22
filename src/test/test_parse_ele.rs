@@ -20,7 +20,8 @@ async fn test_read_all_sessions(){
     init_test_surreal().await;
     let db_path = "/Users/dongpengcheng/Documents/models/e3d_models/AvevaMarineSample/ams000/ams1112_0001";
     let mut io = PdmsIO::new("ams", db_path, true);
-    io.save_sessions_to_db().await.unwrap();
+    io.total_sync_sessions_to_db().await.unwrap();
+    // io.collect_refno_locs_in_session(0x5B1E).await;
     // // let mut cur_ses_page  = io.get_page_basic_info().unwrap().latest_ses_data;
     // let pdms_header = io.read_pdms_header().unwrap();
     // let mut cur_ses_pgno = pdms_header.latest_ses_pgno;

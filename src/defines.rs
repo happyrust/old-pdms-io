@@ -1,6 +1,7 @@
 use deku::bitvec::*;
 use deku::prelude::*;
 use std::convert::{TryFrom, TryInto};
+use aios_core::RefU64;
 use aios_core::tool::db_tool::decode_chars_data;
 use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
 use deku::ctx::Endian;
@@ -38,6 +39,8 @@ pub struct DbPageBasicInfo {
 #[derive(Default, Clone, Debug, PartialEq, DekuRead, DekuWrite, Serialize, Deserialize)]
 #[deku(endian = "big")]
 pub struct SessionPageData {
+    #[deku(skip, default = "0")]
+    pub pgno: usize,
     pub page_type: i32,
     pub last_ses_pageno: i32,
     pub last_ses_extno: i32,
@@ -51,8 +54,8 @@ pub struct SessionPageData {
 
     pub index_root_pageno: u32,
     pub index_root_extno: u32,
-    pub last_claim_pageno: u32,
-    pub last_claim_extno: u32,
+    pub claim_pageno: u32,
+    pub claim_extno: u32,
 
     pub unknown_1: i32,
     pub unknown_2: i32,
@@ -79,17 +82,25 @@ pub struct SessionPageData {
 
 impl SessionPageData {
 
+    #[inline]
+    pub fn get_id(&self, project: &str, dbnum: i32) -> String {
+        format!("{}_{}_{:0>6}", project, dbnum, self.sesno)
+    }
+
     pub fn gen_sur_json(&self, project: &str, dbnum: i32) -> String{
         //id 需要拿 sesno 和 dbnum 组合？还是和文件名组合？
-        let id = format!("{}_{}_{}", project, dbnum, self.sesno);
+        let id = self.get_id(project, dbnum);
         let mut json = serde_json::json!({
             "id": id,
             "sesno": self.sesno,
+            "pgno": self.pgno,
             "dbnum": dbnum,
+            "index_pgno": self.index_root_pageno,
+            "claim_pgno": self.claim_pageno,
             "end_pgno": self.end_pgno,
             "computer_name": self.get_computer_name(),
             "comments": self.get_comments_name(),
-            "date": self.get_timestamp().to_string(),
+            "date": self.get_timestamp().to_rfc3339(),
         });
         json.to_string()
     }
@@ -201,7 +212,7 @@ pub struct RootIndexPage {
 pub struct RefnoDataLoc {
     pub refno_0: u32,
     pub refno_1: u32,
-    pub page_no: u32,
+    pub pgno: u32,
     #[deku(bits = "20")]
     pub offset: u32,
     #[deku(bits = "12")]
@@ -209,9 +220,15 @@ pub struct RefnoDataLoc {
 }
 
 impl RefnoDataLoc {
+
+    #[inline]
+    pub fn get_refno(&self) -> RefU64 {
+        RefU64::from_two_nums(self.refno_0, self.refno_1)
+    }
+
     #[inline]
     pub fn get_att_offset(&self) -> u64 {
-        self.page_no as u64 * 0x800 + self.offset as u64 * 2
+        self.pgno as u64 * 0x800 + self.offset as u64 * 2
     }
 }
 
@@ -256,7 +273,7 @@ pub struct IndexPageData {
 impl IndexPageData {
     #[inline]
     pub fn get_max_pgno(&self) -> u32 {
-        self.refno_locs.iter().map(|x| x.page_no).max().unwrap_or_default()
+        self.refno_locs.iter().map(|x| x.pgno).max().unwrap_or_default()
     }
 }
 
