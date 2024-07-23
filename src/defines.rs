@@ -1,6 +1,7 @@
 use deku::bitvec::*;
 use deku::prelude::*;
 use std::convert::{TryFrom, TryInto};
+use chrono::{DateTime, Utc};
 use deku::ctx::Endian;
 use serde::{Deserialize, Serialize};
 use derivative::Derivative;
@@ -43,13 +44,21 @@ pub struct SessionPageData {
     pub sesno: i32,
     pub unknown_0: i32,  // 0xFF FF FF FF
 
-    pub cur_ses_pageno: u32,
-    pub cur_ses_extno: u32,
+    pub cur_claim_pageno: u32,
+    pub cur_claim_extno: u32,
 
     pub index_root_pageno: u32,
     pub index_root_extno: u32,
-    pub claim_root_pageno: u32,
-    pub claim_root_extno: u32,
+    pub last_claim_pageno: u32,
+    pub last_claim_extno: u32,
+
+    pub unknown_1: i32,
+    pub unknown_2: i32,
+
+    pub year: u32,
+    pub month: u32,
+    pub hours: u32,
+    pub seconds: u32,
 }
 
 ///内含有的几个index part，名称表等等

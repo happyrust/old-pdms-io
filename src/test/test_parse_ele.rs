@@ -10,6 +10,14 @@ async fn test_parse_ele(){
     let mut io = PdmsIO::new(db_path, true);
     let att = io.auto_get_elements_deep(refno).await;
     dbg!(att);
+}
 
+
+#[test]
+fn test_read_all_sessions(){
+    let db_path = "D:/AVEVA/Projects/E3D2.1/AvevaMarineSample/ams000/ams1112_0001";
+    let mut io = PdmsIO::new(db_path, true);
+    let basic_info = io.get_page_basic_info();
+    dbg!(&basic_info);
 
 }
