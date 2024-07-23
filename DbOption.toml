@@ -18,6 +18,7 @@ included_projects = ["AvevaMarineSample", "AvevaCatalogue", "SCB", "ZDJ"]
 mdb_name = "ALL"
 project_name = "AvevaMarineSample"
 project_code = 1516
+surreal_ns = 1516
 module = "DESI"
 #是否生成模型数据
 gen_model = true
@@ -58,7 +59,7 @@ batch_insert_sql_cnt = 100 #mysql 批量插入的数量
 v_ip = "localhost"
 #v_port = "8004"
 #v_port = "8003"
-v_port = "8006"
+v_port = "8008"
 v_user = "root"
 v_password = "root"
 pe_chunk = 500

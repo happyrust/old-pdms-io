@@ -92,12 +92,12 @@ impl PdmsWatcher {
                     continue;
                 }
                 self.file_name_full_path_map.insert(file_name.to_owned(), path.to_path_buf());
-                let mut io = PdmsIO::new(path, true);
+                let mut io = PdmsIO::new("ams", path, true);
                 io.open().unwrap();
                 if let Ok(basic_info) = io.get_page_basic_info() {
                     if let Some(old) = self.headers.get_mut(&path.to_path_buf()) {
                         //未发生修改，直接跳过
-                        if old.pdms_header.page_no == basic_info.pdms_header.page_no { continue; }
+                        if old.pdms_header.latest_ses_pgno == basic_info.pdms_header.latest_ses_pgno { continue; }
                     }
                     self.headers.insert(path.to_path_buf(), basic_info);
                 }
@@ -124,7 +124,7 @@ impl PdmsWatcher {
     ) -> anyhow::Result<IndexMap<PathBuf, DbPageBasicInfo>> {
         let mut result = IndexMap::new();
         for path in paths {
-            let mut io = PdmsIO::new(path, true);
+            let mut io = PdmsIO::new("ams", path, true);
             io.open()?;
             let basic_info = io.get_page_basic_info()?;
             // println!("basic info: {:#4X?}", &basic_info);

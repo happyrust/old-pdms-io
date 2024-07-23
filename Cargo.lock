@@ -87,6 +87,7 @@ dependencies = [
  "derive_more",
  "downcast-rs",
  "dyn-clone",
+ "evalexpr",
  "flate2",
  "futures",
  "geo 0.28.0",
@@ -576,7 +577,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_app"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_derive",
  "bevy_ecs",
@@ -584,6 +585,7 @@ dependencies = [
  "bevy_tasks",
  "bevy_utils",
  "console_error_panic_hook",
+ "ctrlc",
  "downcast-rs",
  "thiserror",
  "wasm-bindgen",
@@ -592,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_core"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -604,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_derive"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_macro_utils",
  "quote",
@@ -613,7 +615,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_ecs"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_ecs_macros",
  "bevy_ptr",
@@ -630,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_ecs_macros"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_macro_utils",
  "proc-macro2",
@@ -640,7 +642,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_hierarchy"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_app",
  "bevy_core",
@@ -652,7 +654,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_macro_utils"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -662,11 +664,13 @@ dependencies = [
 
 [[package]]
 name = "bevy_math"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_reflect",
  "glam",
+ "itertools 0.13.0",
  "rand",
+ "rand_distr",
  "serde",
  "smallvec",
  "thiserror",
@@ -674,11 +678,11 @@ dependencies = [
 
 [[package]]
 name = "bevy_ptr"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 
 [[package]]
 name = "bevy_reflect"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_ptr",
  "bevy_reflect_derive",
@@ -694,7 +698,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_reflect_derive"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_macro_utils",
  "proc-macro2",
@@ -705,16 +709,18 @@ dependencies = [
 
 [[package]]
 name = "bevy_tasks"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "async-executor",
+ "futures-channel",
  "futures-lite 2.3.0",
+ "pin-project",
  "wasm-bindgen-futures",
 ]
 
 [[package]]
 name = "bevy_transform"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "bevy_app",
  "bevy_ecs",
@@ -728,7 +734,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_utils"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "ahash 0.8.11",
  "bevy_utils_proc_macros",
@@ -742,7 +748,7 @@ dependencies = [
 
 [[package]]
 name = "bevy_utils_proc_macros"
-version = "0.14.0-dev"
+version = "0.15.0-dev"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1034,7 +1040,7 @@ dependencies = [
 
 [[package]]
 name = "cavalier_contours"
-version = "0.4.0"
+version = "0.3.0"
 dependencies = [
  "num-traits",
  "serde",
@@ -1501,6 +1507,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctrlc"
+version = "3.4.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "672465ae37dc1bc6380a6547a8883d5dd397b0f1faaad4f265726cc7042a5345"
+dependencies = [
+ "nix",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "cxx"
 version = "1.0.122"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1921,6 +1937,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "evalexpr"
+version = "11.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "63b41cb9dd076076058a4523f009c900c582279536d0b2e45a29aa930e083cc5"
+
+[[package]]
 name = "event-listener"
 version = "2.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2039,18 +2061,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bf7cc16383c4b8d58b9905a8509f02926ce3058053c056376248d958c9df1e8"
 
 [[package]]
-name = "flume"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "55ac459de2512911e4b674ce33cf20befaba382d05b62b008afc1c8b57cbf181"
-dependencies = [
- "futures-core",
- "futures-sink",
- "nanorand",
- "spin 0.9.8",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2119,20 +2129,6 @@ checksum = "eac8f7d7865dcb88bd4373ab671c8cf4508703796caa2b1985a9ca867b3fcb78"
 dependencies = [
  "futures-core",
  "futures-sink",
-]
-
-[[package]]
-name = "futures-concurrency"
-version = "7.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "51ee14e256b9143bfafbf2fddeede6f396650bacf95d06fc1b3f2b503df129a0"
-dependencies = [
- "bitvec",
- "futures-core",
- "futures-lite 1.13.0",
- "pin-project",
- "slab",
- "smallvec",
 ]
 
 [[package]]
@@ -2844,6 +2840,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "413ee7dfc52ee1a4949ceeb7dbc8a33f2d6c088194d9f922fb8318faf1f01186"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3271,15 +3276,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanorand"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a51313c5820b0b02bd422f4b44776fbf47961755c74ce64afc73bfad10226c3"
-dependencies = [
- "getrandom",
-]
-
-[[package]]
 name = "ndarray"
 version = "0.15.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3321,6 +3317,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "77a5d83df9f36fe23f0c3648c6bbb8b0298bb5f1939c8f2704431371f4b84d43"
 dependencies = [
  "smallvec",
+]
+
+[[package]]
+name = "nix"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab2156c4fce2f8df6c499cc1c763e4394b7482525bf2a9701c9d79d215f519e4"
+dependencies = [
+ "bitflags 2.5.0",
+ "cfg-if",
+ "cfg_aliases",
+ "libc",
 ]
 
 [[package]]
@@ -3695,6 +3703,7 @@ dependencies = [
  "nom",
  "once_cell",
  "phf",
+ "pretty-hex",
  "rayon",
  "regex",
  "serde",
@@ -3763,6 +3772,7 @@ dependencies = [
  "futures",
  "futures-util",
  "indexmap 2.2.6",
+ "itertools 0.13.0",
  "log",
  "memchr",
  "nom",
@@ -4303,6 +4313,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_distr"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32cb0b9bc82b0a0876c2dd994a7e7a2683d3e7390ca40e6886785ef0c7e3ee31"
+dependencies = [
+ "num-traits",
+ "rand",
+]
+
+[[package]]
 name = "rawpointer"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4330,9 +4350,9 @@ dependencies = [
 
 [[package]]
 name = "reblessive"
-version = "0.3.5"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4149deda5bd21e0f6ccaa2f907cd542541521dead5861bc51bebdf2af4acaf2a"
+checksum = "568fde39e6aec674be99c9dd38b4c79040faf31038bd5a41ab1908db00c2319b"
 
 [[package]]
 name = "redb"
@@ -4475,9 +4495,9 @@ dependencies = [
 
 [[package]]
 name = "revision"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "588784c1d9453cfd2ce1b7aff06c903513677cf0e63779a0a3085ee8a44f5b17"
+checksum = "b98b99dba8f2787c9af2e46b17ff38437d213d46c8970b550e6b79b862bf7629"
 dependencies = [
  "bincode",
  "chrono",
@@ -4493,9 +4513,9 @@ dependencies = [
 
 [[package]]
 name = "revision-derive"
-version = "0.7.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "854ff0b6794d4e0aab5e4486870941caefe9f258e63cad2f21b49a6302377c85"
+checksum = "3721b4a8e52f9e52c54f74f482a4f550601f5c44cb7876606a2ab79cb09469c1"
 dependencies = [
  "darling 0.20.9",
  "proc-macro-error",
@@ -5519,9 +5539,7 @@ dependencies = [
  "bincode",
  "chrono",
  "dmp",
- "flume",
  "futures",
- "futures-concurrency",
  "geo 0.27.0",
  "indexmap 2.2.6",
  "once_cell",

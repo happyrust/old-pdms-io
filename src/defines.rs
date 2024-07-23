@@ -1,7 +1,9 @@
 use deku::bitvec::*;
 use deku::prelude::*;
 use std::convert::{TryFrom, TryInto};
-use chrono::{DateTime, Utc};
+use aios_core::RefU64;
+use aios_core::tool::db_tool::decode_chars_data;
+use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
 use deku::ctx::Endian;
 use serde::{Deserialize, Serialize};
 use derivative::Derivative;
@@ -18,7 +20,7 @@ pub struct PdmsHeader {
     pub unknown_1: [i32; 5],  //然后是 00 00 00 01
     pub noun: i32,
     pub unknown_2: i32, // 0xFF FF FF FF
-    pub page_no: u32,
+    pub latest_ses_pgno: u32,
     pub ext_no: u32,
 
 }
@@ -37,6 +39,8 @@ pub struct DbPageBasicInfo {
 #[derive(Default, Clone, Debug, PartialEq, DekuRead, DekuWrite, Serialize, Deserialize)]
 #[deku(endian = "big")]
 pub struct SessionPageData {
+    #[deku(skip, default = "0")]
+    pub pgno: usize,
     pub page_type: i32,
     pub last_ses_pageno: i32,
     pub last_ses_extno: i32,
@@ -44,13 +48,14 @@ pub struct SessionPageData {
     pub sesno: i32,
     pub unknown_0: i32,  // 0xFF FF FF FF
 
-    pub cur_claim_pageno: u32,
-    pub cur_claim_extno: u32,
+    //最后一页的页号
+    pub end_pgno: u32,
+    pub end_extno: u32,
 
     pub index_root_pageno: u32,
     pub index_root_extno: u32,
-    pub last_claim_pageno: u32,
-    pub last_claim_extno: u32,
+    pub claim_pageno: u32,
+    pub claim_extno: u32,
 
     pub unknown_1: i32,
     pub unknown_2: i32,
@@ -59,6 +64,90 @@ pub struct SessionPageData {
     pub month: u32,
     pub hours: u32,
     pub seconds: u32,
+
+    pub unknown_u32: [i32; 13],
+    pub name_words_len: u32,
+    #[deku(count = "name_words_len * 4")]
+    pub name_bytes: Vec<u8>,
+    #[deku(count = "(9 - name_words_len) * 4")]
+    pub empty_bytes: Vec<u8>,
+
+    pub comments_words_len: u32,
+    #[deku(count = "comments_words_len * 4")]
+    pub comments_bytes: Vec<u8>,
+
+    #[deku(count = "deku::rest.len()/8")]
+    pub remain_bytes: Vec<u8>,   //剩余的余量bytes
+}
+
+impl SessionPageData {
+
+    #[inline]
+    pub fn get_id(&self, project: &str, dbnum: i32) -> String {
+        format!("{}_{}_{:0>6}", project, dbnum, self.sesno)
+    }
+
+    pub fn gen_sur_json(&self, project: &str, dbnum: i32) -> String{
+        //id 需要拿 sesno 和 dbnum 组合？还是和文件名组合？
+        let id = self.get_id(project, dbnum);
+        let mut json = serde_json::json!({
+            "id": id,
+            "sesno": self.sesno,
+            "pgno": self.pgno,
+            "dbnum": dbnum,
+            "index_pgno": self.index_root_pageno,
+            "claim_pgno": self.claim_pageno,
+            "end_pgno": self.end_pgno,
+            "computer_name": self.get_computer_name(),
+            "comments": self.get_comments_name(),
+            "date": self.get_timestamp().to_rfc3339(),
+        });
+        json.to_string()
+    }
+
+    #[inline]
+    pub fn get_timestamp(&self) -> DateTime<Utc> {
+        let year = self.year;
+        let month = self.month;
+        let days = self.hours / 24;
+        let hours = self.hours % 24;
+        let minutes = self.seconds / 60;
+        let seconds = self.seconds % 60;
+        Utc.with_ymd_and_hms(year as i32, month as u32, days, hours as u32, minutes, seconds).latest().unwrap()
+    }
+
+
+    #[inline]
+    pub fn get_computer_name(&self) -> String {
+        if self.name_words_len == 0 {
+            return String::new();
+        }
+        //去掉后面为 0 的 bytes
+        let i = (self.name_words_len as usize - 1) * 4;
+        // dbg!(&self.name_bytes[i as usize..]);
+        let rpos = self.name_bytes[i..].into_iter().rev().position(|&x| x != 0).unwrap_or(0);
+        // dbg!(rpos);
+        decode_chars_data(&self.name_bytes[..(i+4-rpos)]).0
+    }
+
+    #[inline]
+    pub fn get_comments_name(&self) -> String {
+        if self.comments_words_len == 0 {
+            return String::new();
+        }
+        //去掉后面为 0 的 bytes
+        let i = (self.comments_words_len as usize - 1) * 4;
+        // dbg!(&self.comments_bytes[i as usize..]);
+        let rpos = self.comments_bytes[i..].into_iter().rev().position(|&x| x != 0).unwrap_or(0);
+        // dbg!(rpos);
+        decode_chars_data(&self.comments_bytes[..(i+4-rpos)]).0
+    }
+
+    //是否需要要检测有无变化？先拿到最新的数据试试看里面的参考号，和之前的比有无变化
+    pub fn get_session_saved_refnos() {
+
+    }
+
 }
 
 ///内含有的几个index part，名称表等等
@@ -123,7 +212,7 @@ pub struct RootIndexPage {
 pub struct RefnoDataLoc {
     pub refno_0: u32,
     pub refno_1: u32,
-    pub page_no: u32,
+    pub pgno: u32,
     #[deku(bits = "20")]
     pub offset: u32,
     #[deku(bits = "12")]
@@ -131,9 +220,15 @@ pub struct RefnoDataLoc {
 }
 
 impl RefnoDataLoc {
+
+    #[inline]
+    pub fn get_refno(&self) -> RefU64 {
+        RefU64::from_two_nums(self.refno_0, self.refno_1)
+    }
+
     #[inline]
     pub fn get_att_offset(&self) -> u64 {
-        self.page_no as u64 * 0x800 + self.offset as u64 * 2
+        self.pgno as u64 * 0x800 + self.offset as u64 * 2
     }
 }
 
@@ -178,7 +273,7 @@ pub struct IndexPageData {
 impl IndexPageData {
     #[inline]
     pub fn get_max_pgno(&self) -> u32 {
-        self.refno_locs.iter().map(|x| x.page_no).max().unwrap_or_default()
+        self.refno_locs.iter().map(|x| x.pgno).max().unwrap_or_default()
     }
 }
 
