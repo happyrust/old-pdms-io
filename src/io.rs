@@ -135,14 +135,16 @@ impl PdmsIO {
         } else {
             &data[..]
         };
-        parse_ele_data(input).await
+        let mut ele_data = parse_ele_data(input, (refno_offset / 0x800) as _).await?;
+        Ok(ele_data)
     }
 
     //TODO 做一个不处理UDA的方法
     #[inline]
     pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
         let loc = self.search_refno_pgno(refno)?;
-        self.get_element(loc.get_att_offset()).await
+        let mut ele_data = self.get_element(loc.get_att_offset()).await?;
+        Ok(ele_data)
     }
 
     pub async fn auto_get_elements_deep(&mut self, refno: RefU64) -> anyhow::Result<HashMap<RefU64, EleData>> {
@@ -247,7 +249,7 @@ impl PdmsIO {
             let sql = format!("insert into e3d_ses {}",
                               cur_ses_page.gen_sur_json(project.as_str(), pdms_header.db_num));
             //执行 sql
-            // SUL_DB.query(&sql).await.unwrap();
+            SUL_DB.query(&sql).await.unwrap();
 
             let ses_id = cur_ses_page.get_id(project.as_str(), pdms_header.db_num);
             let mut all_relates = Vec::new();
@@ -424,7 +426,7 @@ impl PdmsIO {
                     jsons.push(pe.gen_sur_json(Some(pe.history_id())));
                 }
                 let sql = format!("INSERT IGNORE INTO pe_history [{}];", jsons.join(","));
-                println!("sql is {}", &sql);
+                println!("insert sql is {}", &sql);
                 SUL_DB.query(sql).await.unwrap();
             }
 
@@ -455,7 +457,8 @@ impl PdmsIO {
                 //pe 直接就加在 pe_relate，然后通过 pe_relate 去查看 pe 的 delete 属性
                 //delete 属性后面要用起来
                 for ele_data in es {
-                    if let Some(json) = ele_data.att_map().gen_sur_json_with_id(ele_data.att_map().history_id()) {
+                    let id = ele_data.whole_attmap.att_map().history_id();
+                    if let Some(json) = ele_data.whole_attmap.att_map().gen_sur_json_with_id(id) {
                         jsons.push(json);
                     }
                 }

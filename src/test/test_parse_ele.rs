@@ -16,8 +16,10 @@ async fn test_parse_ele(){
 
 #[tokio::test]
 async fn test_read_all_sessions(){
-    // let db_path = "D:/AVEVA/Projects/E3D2.1/AvevaMarineSample/ams000/ams1112_0001";
     init_test_surreal().await;
+    #[cfg(target_os = "windows")]
+    let db_path = "D:/AVEVA/Projects/E3D2.1/AvevaMarineSample/ams000/ams1112_0001";
+    #[cfg(target_os = "macos")]
     let db_path = "/Users/dongpengcheng/Documents/models/e3d_models/AvevaMarineSample/ams000/ams1112_0001";
     let mut io = PdmsIO::new("ams", db_path, true);
     io.total_sync_sessions_to_db().await.unwrap();
