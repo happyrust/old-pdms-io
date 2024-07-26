@@ -6,7 +6,7 @@ use std::fmt::format;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::mem::size_of;
-use std::ops::Range;
+use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use anyhow::anyhow;
@@ -22,8 +22,11 @@ pub struct PdmsIO {
     pub path: PathBuf,
     pub readonly: bool,
     pub file: Option<File>,
+    //sesno
     pub ses_data_map: HashMap<u32, SessionPageData>,
-    pub ses_range_map: BTreeMap<i32, Range<u32>>
+    pub sesno_pgno_map: BTreeMap<i32, u32>,
+    //start pgno 和 end pgno
+    pub ses_range_map: BTreeMap<i32, Range<u32>>,
 }
 
 impl PdmsIO {
@@ -49,6 +52,7 @@ impl PdmsIO {
             readonly,
             file: None,
             ses_data_map: Default::default(),
+            sesno_pgno_map: Default::default(),
             ses_range_map: Default::default(),
         }
     }
@@ -72,12 +76,14 @@ impl PdmsIO {
         let pdms_header = self.read_pdms_header()?;
         let mut cur_ses_pgno = pdms_header.latest_ses_pgno;
         let mut map = BTreeMap::new();
+        let mut sesno_pgno_map = BTreeMap::new();
 
         //遍历整个文件数据, 从最新的最前的遍历
         while cur_ses_pgno > 4 {
             let cur_ses_page = self.read_ses_data(cur_ses_pgno as _)?;
             let range = (cur_ses_page.last_ses_pageno as u32)..cur_ses_pgno;
             map.insert(cur_ses_page.sesno, range);
+            sesno_pgno_map.insert(cur_ses_page.sesno, cur_ses_pgno);
             if cur_ses_page.last_ses_pageno < 0 {
                 break;
             }
@@ -85,21 +91,44 @@ impl PdmsIO {
         }
 
         self.ses_range_map = map;
+        self.sesno_pgno_map = sesno_pgno_map;
 
         Ok(())
     }
 
     /// 根据pgno, 获取 sesno
-    pub fn get_sesno(&self, pgno: u32) -> Option<u32>{
-        for (sesno, range) in &self.ses_range_map{
-            if range.contains(&pgno){
+    pub fn get_sesno(&self, pgno: u32) -> Option<u32> {
+        for (sesno, range) in &self.ses_range_map {
+            if range.contains(&pgno) {
                 return Some(*sesno as _);
             }
         }
         None
     }
 
-    pub fn get_att_latest_pgno(&mut self) -> anyhow::Result<u32> {
+    pub fn read_latest_ses_page(&mut self) {
+
+    }
+
+    ///获取最新属性pgno
+    pub fn get_latest_att_pgno(&mut self) -> anyhow::Result<u32> {
+        let header = self.read_pdms_header()?;
+        let ses_pgno = header.latest_ses_pgno;
+        // let ses_data = self.read_ses_data(ses_pgno)?;
+        let all_locs = self.collect_refno_locs_in_session(ses_pgno as _);
+        let max_pgno = all_locs.iter().map(|x| x.pgno).max().unwrap_or_default();
+        Ok(max_pgno)
+    }
+
+    ///获得最新的饿sesno
+    pub fn get_latest_att_sesno(&mut self) -> anyhow::Result<u32> {
+        let header = self.read_pdms_header()?;
+        let latest_ses_data = self.read_ses_data(header.latest_ses_pgno)?;
+        Ok(latest_ses_data.sesno as _)
+    }
+
+
+    pub fn get_att_latest_pgno_old(&mut self) -> anyhow::Result<u32> {
         let mut file = self.get_file()?;
         let mut input = vec![];
         file.read_to_end(&mut input)?;
@@ -107,11 +136,11 @@ impl PdmsIO {
         let mut pos_iter = rfind_iter(&input, &REFNO_LEAF_INDEX_PAGE[..]);
         let mut max_pgno = 0;
         while let Some(pos) = pos_iter.next() {
-            // println!("Found leaf index page at: {:#04X?}", pgno);
-            let index_data = self.read_index_data((pos / 0x800) as _)?;
-            // dbg!(&index_data);
-            max_pgno = index_data.refno_locs.iter().filter(|x|
-            x.pgno <= file_max_pgno)
+            let pgno = (pos / 0x800) as _;
+            println!("Found leaf index page at: {:#04X?}", pgno);
+            let index_data = self.read_index_data(pgno)?;
+            dbg!(&index_data);
+            max_pgno = index_data.refno_locs.iter().filter(|x| x.pgno <= file_max_pgno)
                 .map(|x| x.pgno).max().unwrap_or_default().max(max_pgno);
             break;
         }
@@ -227,11 +256,16 @@ impl PdmsIO {
         if !self.ses_data_map.contains_key(&ses_pgno) {
             let file = self.get_file()?;
             let mut ses_data = vec![];
-            ses_data.resize(size_of::<SessionPageData>(), 0u8);
-            file.seek(SeekFrom::Start(ses_pgno as u64 * 0x800))?;
+            // ses_data.resize(size_of::<SessionPageData>(), 0u8);
+            ses_data.resize(PAGE_SIZE, 0u8);
+            let offset = ses_pgno as u64 * PAGE_SIZE as u64;
+            file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut ses_data)?;
+            // dbg!(ses_pgno);
+            SessionPageData::try_from(ses_data.as_ref()).unwrap();
             if let Ok(mut s) = SessionPageData::try_from(ses_data.as_ref()) {
                 s.pgno = ses_pgno as _;
+                // dbg!(ses_pgno);
                 self.ses_data_map.insert(ses_pgno, s);
             }
         }
@@ -241,12 +275,12 @@ impl PdmsIO {
     #[inline]
     pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<IndexPageData> {
         let file = self.get_file()?;
-        let mut ses_data = vec![];
-        ses_data.resize(0x800, 0u8);
-        file.seek(SeekFrom::Start(index_pgno as u64 * 0x800))?;
-        file.read_exact(&mut ses_data)?;
-        let ses_page_data = IndexPageData::try_from(ses_data.as_ref())?;
-        Ok(ses_page_data)
+        let mut index_data = vec![];
+        index_data.resize(PAGE_SIZE, 0u8);
+        file.seek(SeekFrom::Start(index_pgno as u64 * PAGE_SIZE as u64))?;
+        file.read_exact(&mut index_data)?;
+        let index_page_data = IndexPageData::try_from(index_data.as_ref())?;
+        Ok(index_page_data)
     }
 
     ///指定 refno，收集它的历史数据
@@ -307,14 +341,14 @@ impl PdmsIO {
                 all_relates.push(format!("{{ id:[e3d_ses:{}, {i}], in: {}, out: e3d_ses:{}, pgno:{}, offset:{} }}",
                                          ses_str, &pe_id, ses_str, loc.pgno, loc.offset));
 
-                let ele_data = self.get_element(loc.get_att_offset()).await?;
-                let att = ele_data.att_map();
-                if !is_latest{
-                    let json = att.gen_sur_json_with_id(format!("{}_{}", refno, sesno)).unwrap();
-                    let sql = format!("INSERT INTO {} {};", att.get_type_str(), &json);
-                    all_his_att_sql.push_str(&sql);
-                };
-
+                if let Ok(ele_data) = self.get_element(loc.get_att_offset()).await {
+                    let att = ele_data.att_map();
+                    if !is_latest {
+                        let json = att.gen_sur_json_with_id(format!("{}_{}", refno, sesno)).unwrap();
+                        let sql = format!("INSERT INTO {} {};", att.get_type_str(), &json);
+                        all_his_att_sql.push_str(&sql);
+                    };
+                }
                 latest_refno_map.entry(refno).or_insert_with(|| loc.clone());
             }
             // println!("hist att sql: {}", &all_his_att_sql);
@@ -331,7 +365,7 @@ impl PdmsIO {
             // println!("session pgno {:#4X}: {:#4X}", cur_ses_pgno, offset / 0x800);
             // dbg!((cur_ses_no, offset));
             // dbg!(cur_ses_page.last_ses_pageno);
-            if step == 50{
+            if step == 50 {
                 break;
             }
             if cur_ses_page.last_ses_pageno < 0 {
@@ -585,6 +619,16 @@ impl PdmsIO {
     //old, new
     pub async fn compare_eles_between_sessions() {}
 
+    #[inline]
+    pub fn get_ses_pageno(&self, sesno: i32) -> Option<u32>{
+        self.sesno_pgno_map.get(&sesno).cloned()
+    }
+
+    #[inline]
+    pub fn collect_refno_locs(&mut self, sesno: i32) -> Vec<RefnoDataLoc> {
+        self.get_ses_pageno(sesno).map(|ses_pgno| self.collect_refno_locs_in_session(ses_pgno)).unwrap_or_default()
+    }
+
     pub fn collect_refno_locs_in_session(&mut self, ses_pgno: u32) -> Vec<RefnoDataLoc> {
         //读取当前会话层有多少属性保存了，是否需要读取 index 数据，然后开始读取属性数据
         //过滤 index 里面的 pgno 大于当前会话的 pgno 的数据
@@ -660,9 +704,30 @@ impl PdmsIO {
         Some(true)
     }
 
+    /// 收集session范围内的增删改的element数据
+    /// 并在这里即可判断是否增删改？
+    pub async fn collect_increment_eles(
+        &mut self,
+        sesno_range: RangeInclusive<i32>,
+    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
+        let mut eles_map = HashMap::new();
+
+        for sesno in sesno_range.into_iter().rev() {
+            let final_locs = self.collect_refno_locs(sesno);
+            //从后往前查看，如果是已经有了数据，就不需要再往里面加了
+            for loc in final_locs {
+                if !eles_map.contains_key(&loc.get_refno()) {
+                    let ele = self.get_element(loc.get_att_offset()).await?;
+                    eles_map.insert(ele.refno, ele);
+                }
+            }
+        }
+        Ok(eles_map)
+    }
+
 
     //直接读取中间这段数据的att index table，直接获取所有需要的数据
-    pub async fn collect_increment_eles(
+    pub async fn collect_increment_eles_old(
         &mut self,
         till_pageno: u32,
     ) -> anyhow::Result<HashMap<RefU64, EleData>> {
@@ -700,7 +765,7 @@ impl PdmsIO {
 
         let mut eles_map = HashMap::new();
         for (refno, offset) in refno_data_offsets_map {
-            match self.get_element(offset, ).await {
+            match self.get_element(offset).await {
                 Ok(ele) => {
                     eles_map.insert(ele.refno, ele);
                 }
