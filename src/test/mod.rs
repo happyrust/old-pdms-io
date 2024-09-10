@@ -10,3 +10,5 @@ pub mod test_max_att_version;
 pub mod test_parse_ele;
 
 pub mod test_ses_data;
+
+pub mod test_history_data;

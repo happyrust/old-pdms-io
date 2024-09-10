@@ -1,5 +1,14 @@
-use aios_core::{get_default_pdms_db_info, RefU64Vec, SUL_DB};
-use aios_core::pdms_types::{PdmsElement, RefU64};
+use crate::defines::*;
+use aios_core::pdms_data::DataOperation;
+use aios_core::pdms_types::{EleOperation, PdmsElement, RefU64};
+use aios_core::{
+    get_default_pdms_db_info, NamedAttrValue, RefU64Vec, RefnoEnum, RefnoSesno, SUL_DB,
+};
+use anyhow::anyhow;
+use dashmap::DashMap;
+use futures_util::{FutureExt, StreamExt};
+use memchr::memmem::rfind_iter;
+use parse_pdms_db::parse::*;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::fmt::format;
@@ -9,18 +18,13 @@ use std::mem::size_of;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use anyhow::anyhow;
-use dashmap::DashMap;
-use futures_util::{FutureExt, StreamExt};
-use memchr::memmem::rfind_iter;
-use crate::defines::*;
-use parse_pdms_db::parse::*;
 
 #[derive(Debug)]
 pub struct PdmsIO {
     pub project: String,
     pub path: PathBuf,
     pub readonly: bool,
+    pub dbnum: i32,
     pub file: Option<File>,
     //sesno
     pub ses_data_map: HashMap<u32, SessionPageData>,
@@ -41,7 +45,18 @@ impl PdmsIO {
     }
 }
 
-const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [0x00u8, 0x00, 0x00, 0x05, 0x00, 0xCC, 0x47, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02];
+const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [
+    0x00u8, 0x00, 0x00, 0x05, 0x00, 0xCC, 0x47, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x02,
+];
+
+#[derive(Debug)]
+enum SesSqlType {
+    SesJson(Vec<String>),
+    PeSesSql(Vec<String>),
+    PeHJson(Vec<String>),
+    PeOwnerSql(Vec<String>),
+}
 
 impl PdmsIO {
     ///新建一个PdmsIO
@@ -51,6 +66,7 @@ impl PdmsIO {
             path: path.as_ref().to_path_buf(),
             readonly,
             file: None,
+            dbnum: 0,
             ses_data_map: Default::default(),
             sesno_pgno_map: Default::default(),
             ses_range_map: Default::default(),
@@ -77,7 +93,7 @@ impl PdmsIO {
         let mut cur_ses_pgno = pdms_header.latest_ses_pgno;
         let mut map = BTreeMap::new();
         let mut sesno_pgno_map = BTreeMap::new();
-
+        self.dbnum = pdms_header.db_num as _;
         //遍历整个文件数据, 从最新的最前的遍历
         while cur_ses_pgno > 4 {
             let cur_ses_page = self.read_ses_data(cur_ses_pgno as _)?;
@@ -106,9 +122,7 @@ impl PdmsIO {
         None
     }
 
-    pub fn read_latest_ses_page(&mut self) {
-
-    }
+    pub fn read_latest_ses_page(&mut self) {}
 
     ///获取最新属性pgno
     pub fn get_latest_att_pgno(&mut self) -> anyhow::Result<u32> {
@@ -127,7 +141,6 @@ impl PdmsIO {
         Ok(latest_ses_data.sesno as _)
     }
 
-
     pub fn get_att_latest_pgno_old(&mut self) -> anyhow::Result<u32> {
         let mut file = self.get_file()?;
         let mut input = vec![];
@@ -140,8 +153,14 @@ impl PdmsIO {
             println!("Found leaf index page at: {:#04X?}", pgno);
             let index_data = self.read_index_data(pgno)?;
             dbg!(&index_data);
-            max_pgno = index_data.refno_locs.iter().filter(|x| x.pgno <= file_max_pgno)
-                .map(|x| x.pgno).max().unwrap_or_default().max(max_pgno);
+            max_pgno = index_data
+                .refno_locs
+                .iter()
+                .filter(|x| x.pgno <= file_max_pgno)
+                .map(|x| x.pgno)
+                .max()
+                .unwrap_or_default()
+                .max(max_pgno);
             break;
         }
         Ok(max_pgno)
@@ -155,15 +174,18 @@ impl PdmsIO {
         let (r0, r1) = (refno.get_0(), refno.get_1());
         while level >= 0 {
             let mut next_loc_index = if level == 0 {
-                index_data.refno_locs.iter().position(|x| x.refno_0 == r0 && x.refno_1 == r1)
+                index_data
+                    .refno_locs
+                    .iter()
+                    .position(|x| x.refno_0 == r0 && x.refno_1 == r1)
             } else {
-                index_data.refno_locs.windows(2).position(
-                    |x| (x[1].refno_0 > r0 && x[0].refno_0 <= r0)   //r0的范围找到后，可以停止
+                index_data.refno_locs.windows(2).position(|x| {
+                    (x[1].refno_0 > r0 && x[0].refno_0 <= r0)   //r0的范围找到后，可以停止
                         || (
                         (r0 >= x[0].refno_0 && r1 >= x[0].refno_1)
                             && (r0 <= x[1].refno_0 && r1 < x[1].refno_1)
                     )
-                )
+                })
             };
             if level == 0 && next_loc_index.is_none() {
                 break;
@@ -212,7 +234,10 @@ impl PdmsIO {
         Ok(ele_data)
     }
 
-    pub async fn auto_get_elements_deep(&mut self, refno: RefU64) -> anyhow::Result<HashMap<RefU64, EleData>> {
+    pub async fn auto_get_elements_deep(
+        &mut self,
+        refno: RefU64,
+    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
         let mut map = HashMap::new();
         let mut pendings = VecDeque::new();
         pendings.push_back(refno);
@@ -269,7 +294,10 @@ impl PdmsIO {
                 self.ses_data_map.insert(ses_pgno, s);
             }
         }
-        return self.ses_data_map.get(&ses_pgno).ok_or(anyhow!("Can't read ses page with {ses_pgno}."));
+        return self
+            .ses_data_map
+            .get(&ses_pgno)
+            .ok_or(anyhow!("Can't read ses page with {ses_pgno}."));
     }
 
     #[inline]
@@ -292,240 +320,715 @@ impl PdmsIO {
         eles
     }
 
-    //todo add some date filter ? session filter
-    pub async fn total_sync_sessions_to_db(&mut self) -> anyhow::Result<()> {
-        use itertools::Itertools;
-
-        //删除所有的历史数据
-        SUL_DB.query("DELETE  e3d_ses;").await.unwrap();
-        SUL_DB.query("DELETE  pe_history;").await.unwrap();
-        SUL_DB.query("DELETE  ses_pe_relate;").await.unwrap();
-
+    ///存储所有的参考号和对应的 sesno 数据
+    /// 返回一个历史参考号集合，值为所有的位置
+    pub async fn store_all_refno_sesno_map(
+        &mut self,
+    ) -> anyhow::Result<BTreeMap<RefU64, BTreeSet<u64>>> {
+        let mut history_loc_map: BTreeMap<RefU64, BTreeSet<u64>> = BTreeMap::new();
         let pdms_header = self.read_pdms_header().unwrap();
         let dbnum = pdms_header.db_num;
         let mut cur_ses_pgno = pdms_header.latest_ses_pgno;
-        let project = self.project.clone();
-
-        //显示出有哪些修改，使用 json diff 工具
-        let mut step = 0;
-        //遍历整个文件数据, 从最新的最前的遍历
-        let mut latest_refno_map = DashMap::new();
-        let mut all_relates = Vec::new();
-        while cur_ses_pgno > 4 {
-            // println!("cur_ses_pgno: {:#4X?}", cur_ses_pgno);
-            //数据还是跟 pgno ?
-            // let all_ents_in_ses = self.collect_refno_los_in_session(cur_ses_pgno as _).await;
-            //历史数据是否需要存储的问题？
-            // dbg!(&all_ents_in_ses);
-            let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
-            // dbg!(all_locs.len());
-
-            let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
-            //保存session 数据
-            Self::save_ses_data(&pdms_header, &project, &cur_ses_page).await;
-
-            let mut all_his_att_sql = String::new();
-            let sesno = cur_ses_page.sesno;
-            let ses_str = cur_ses_page.get_id(project.as_str(), pdms_header.db_num);
-            for (i, loc) in all_locs.iter().enumerate() {
-                //如果是最新的，就不需要加版本后缀
-                //如果是历史版本，就需要有历史后缀，简单点就是是否之后出现过
-                let refno = loc.get_refno();
-                //从后往前找的天然优势，就是后面的永远是最新的，如果发现历史的数据了，就加上版本号
-                let is_latest = !latest_refno_map.contains_key(&refno);
-                let pe_id = if is_latest {
-                    format!("pe:{}", refno)
-                } else {
-                    format!("pe:{}_{}", refno, sesno)
-                };
-                all_relates.push(format!("{{ id:[e3d_ses:{}, {i}], in: {}, out: e3d_ses:{}, pgno:{}, offset:{} }}",
-                                         ses_str, &pe_id, ses_str, loc.pgno, loc.offset));
-
-                if let Ok(ele_data) = self.get_element(loc.get_att_offset()).await {
-                    let att = ele_data.att_map();
-                    if !is_latest {
-                        let json = att.gen_sur_json_with_id(format!("{}_{}", refno, sesno)).unwrap();
-                        let sql = format!("INSERT INTO {} {};", att.get_type_str(), &json);
-                        all_his_att_sql.push_str(&sql);
-                    };
+        //收集所有的 session 和 refno 的对应关系
+        //表pe_ses_h:  id([refno, sesno]), refno(指向最新？), sesno, offset, dbnum, ses_table
+        let mut pe_ses_sqls = Vec::new();
+        // SUL_DB.query("remove table ses;").await.unwrap();
+        //使用 channel 来保存 sql 数据
+        let (tx, rx) = flume::unbounded::<SesSqlType>();
+        let mut handles = Vec::new();
+        //开启一个保存 pe_ses_h 的线程
+        let handle = tokio::spawn(async move {
+            while let Ok(values) = rx.try_recv() {
+                match values {
+                    //保存 session 数据
+                    SesSqlType::SesJson(values) => {
+                        for chunk in values.chunks(100) {
+                            //插入 json 数据
+                            let sql = format!("INSERT INTO ses [{}];", chunk.join(","));
+                            // println!("ses sql: {}", &sql);
+                            SUL_DB.query(sql).await.unwrap();
+                        }
+                    }
+                    SesSqlType::PeSesSql(values) => {
+                        for chunk in values.chunks(100) {
+                            let sql = format!("INSERT INTO pe_ses_h (id, refno, sesno, offset, dbnum, ses) VALUES {};", chunk.join(","));
+                            SUL_DB.query(sql).await.unwrap();
+                        }
+                    }
+                    _ => {}
                 }
-                latest_refno_map.entry(refno).or_insert_with(|| loc.clone());
             }
-            // println!("hist att sql: {}", &all_his_att_sql);
-            //保存历史属性数据
-            SUL_DB.query(all_his_att_sql).await.unwrap();
+        });
+        handles.push(handle);
+        // 跳过没有变化的数据，需要用个hash 来记录
+        let mut latest_refno_map = DashMap::new();
+        while cur_ses_pgno > 4 {
+            // dbg!(cur_ses_pgno);
+            let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
+            let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
+            let sesno = cur_ses_page.sesno;
+            // if sesno < 896 {
+            //     break;
+            // }
+            let ses_id = cur_ses_page.get_id(dbnum);
+            tx.send(SesSqlType::SesJson(vec![cur_ses_page.gen_sur_json(dbnum)]));
 
-            //直接通过数据库查是否最新？还是通过文件查找？
-            //每个参考号都去拉取一遍，然后看看是不是最新的？
-
-            // let offset = cur_ses_page.end_pgno * 0x800 + 0x4;
-            // let bytes = io.read_bytes(offset, 4).unwrap();
-            // let type_name = db1_dehash(u32::from_be_bytes(bytes.try_into().unwrap()));
-            // dbg!(type_name);
-            // println!("session pgno {:#4X}: {:#4X}", cur_ses_pgno, offset / 0x800);
-            // dbg!((cur_ses_no, offset));
-            // dbg!(cur_ses_page.last_ses_pageno);
-            if step == 50 {
-                break;
+            for loc in all_locs {
+                let refno = loc.get_refno();
+                let offset = loc.get_att_offset();
+                //需要记录所有的 offset 数据，如果有两个以上的，代表有历史数据，需要在后面做比较
+                //根据读取的数据判断是否有增删改
+                history_loc_map.entry(refno).or_default().insert(offset);
+                let is_latest = !latest_refno_map.contains_key(&refno);
+                //如果是最新的，就不需要保存到历史数据
+                if is_latest {
+                    latest_refno_map.insert(refno, loc);
+                    continue;
+                }
+                let id = format!("['{}', {}]", refno, sesno);
+                pe_ses_sqls.push(format!(
+                    "({}, {}, {}, {}, {}, ses:[{}, {}])",
+                    id,
+                    refno.to_pe_key(),
+                    sesno,
+                    offset,
+                    dbnum,
+                    ses_id[0],
+                    ses_id[1]
+                ));
             }
+
+            //按 chunks 保存数据
+            if pe_ses_sqls.len() > 100 {
+                tx.send(SesSqlType::PeSesSql(std::mem::take(&mut pe_ses_sqls)))
+                    .unwrap();
+            }
+
             if cur_ses_page.last_ses_pageno < 0 {
                 break;
             }
-            step += 1;
             cur_ses_pgno = cur_ses_page.last_ses_pageno as _;
-            // dbg!(last_ses_no);
-            // dbg!(cur_ses_page.get_timestamp());
-            // dbg!(cur_ses_page.get_computer_name());
-            // dbg!(cur_ses_page.get_comments_name());
-
-            // break;
+        }
+        if pe_ses_sqls.len() > 0 {
+            tx.send(SesSqlType::PeSesSql(pe_ses_sqls)).unwrap();
+        }
+        //关闭 channel
+        drop(tx);
+        for handle in handles {
+            handle.await.unwrap();
         }
 
-        Self::save_ses_pe_relates(&all_relates).await;
+        //去掉 value 的长度为 1 的数据
+        // history_loc_map.retain(|_, v| v.len() > 1);
+        Ok(history_loc_map)
+    }
 
-        return Ok(());
+    pub async fn total_sync_history_use_channel(&mut self) -> anyhow::Result<()> {
+        // let history_pe_map = self.store_all_refno_sesno_map().await?;
+        // dbg!(&history_pe_map.len());
+        // // 遍历所有的 offset, 读取属性数据，得到 attmap
+        // // let mut ses_map = HashMap::new();
+        // let dbnum = self.dbnum;
+        // let mut pe_owner_h_relates = Vec::new();
+        // let mut all_his_pe_json = Vec::new();
+        // //使用channel 来保存数据到数据库
+        // let (tx, rx) = flume::unbounded::<SesSqlType>();
 
-        //refno_pgnos_map 查询里面 value 最多的项
-        // let max_history_refno = refno_pgnos_map.iter().max_by_key(|x| x.1.len());
-        // dbg!(&max_history_refno);
-
-        //pe_history
-        //pe_owner history 是否有必要
-        //pe_owner 始终是最新的数据
-        //pe_owner_history  为  pe_history 之间的关联关系？也有可能是 pe
-        //如果 children 发生变化，确实需要记录这个，如果 pe 里没有的，那就是在pe_history 里面
-        //NOUN_history
-        //保存历史属性数据到数据库
-        let mut type_att_map = BTreeMap::new();
-        let mut found = false;
-        //e3d_session 是否要绑定一个Operation log 的指向，还是直接可以对比两个session 就可以得到？
-        //但是这样没法实现参考号查询自己是啥时候发生删除的，或者修改的
-        // let mut history_owner_map = HashMap::new();
-        // for (&refno, locs) in &refno_pgnos_map {
-        //     if locs.is_empty(){
-        //         continue;
-        //     }
-        //     //表示有历史记录，后面存储的都是old data, 查询时需要和latest data 合着一起查询
-        //     dbg!(locs.len());
-        //     //（1）按着从小到大的顺序排列的，所以后面的是新的，可以判断构件是否被删除
-        //     //如果是新增加的呢？怎么样维护这个是否新增的关系，这里就要比较这个 ses no 的关系了，在查询的时候，如果是按
-        //     //历史记录查询，需要加个 sesno 的条件过滤，或者 pgno 的过滤，子节点的 pngo 不能超过某个pgno
-        //     //删除了肯定是不能再加回去这个参考号的
-        //     //是否需要弄个pe_history? 还是就放在 pe 里面？应该是都放在 pe 里，然后历史的数据需要加上，以为 pe 是唯一的
-        //     //即使属性发生变化，也只是 pgno 的变化
-        //     let mut prev_children = RefU64Vec::default();
-        //     //todo 使用 chunk
-        //     let mut ses_relates = Vec::new();
-        //     let len = locs.len();
-        //     let mut all_pes = Vec::new();
-        //     //pe_owner 怎么处理？
-        //     //解析时，要快速定位所在 sesno，要记录下来，设置到 pgno，现在不能用 pgno 了，sesno 更具有代表性
-        //     for (index, (pgno, sesno, offset)) in locs.into_iter().enumerate() {
-        //         let addr = *pgno as u64 * 0x800 + *offset as u64 * 2;
-        //         if let Ok(mut data) = self.get_element(addr).await{
-        //             let mut att = &mut data.whole_attmap.attmap;
-        //             let mut pe = att.pe(dbnum);
-        //             //需要在这里检测是否和上一个比，有 delete 的变化，也就是比较 children
-        //             //检查 children 的数据是否发生变化
-        //             if !data.children.is_empty(){
-        //                 //如果在历史层级关系里没有查询到的，需要去 pe 里去找，如果 pe 里没有那就是真没有
-        //                 //保存节点关系的历史记录
-        //                 // let owner_id = pe.history_id();
-        //                 // history_owner_map.insert((pe.refno, pgno, sesno), data.children.clone());
-        //                 //TODO modified refnos
-        //                 //过滤出删除的参考号
-        //                 let all_deleted = prev_children.iter().cloned().filter(|x|{
-        //                     !data.children.contains(x)
-        //                 }).collect::<BTreeSet<_>>();
-        //
-        //                 //过滤出新增的参考号
-        //                 let all_added = data.children.iter().cloned().filter(|x|{
-        //                     !prev_children.contains(x)
-        //                 }).collect::<BTreeSet<_>>();
-        //                 let ses_id = format!("{}_{}_{:0>6}", project, dbnum, sesno);
-        //                 //插入删除的操作记录
-        //                 //将删除的 pe 要重新插入回去，然后设置为 deleted
-        //                 for (j, r) in all_deleted.iter().enumerate(){
-        //                     let op: i32 = DataOperation::Deleted.into();
-        //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, op: {} }}",
-        //                                              ses_id, len+j, r, ses_id, op));
-        //                     //要读取到这个删除的 att
-        //                     pe.deleted = true;
-        //                     // all_deleted_pes.push(pe);
+        // let rx_clone = rx.clone();
+        // //开启一个保存 pe_owner_h 的线程
+        // let handle = tokio::spawn(async move {
+        //     while let Ok(values) = rx_clone.recv() {
+        //         match values {
+        //             SesSqlType::PeOwnerSql(values) => {
+        //                 for chunk in values.chunks(100){
+        //                     //插入 json 数据
+        //                     let sql = format!("INSERT RELATION INTO pe_owner [{}];", chunk.join(","));
+        //                     SUL_DB.query(sql).await.unwrap();
         //                 }
-        //
-        //                 //插入新增的增加的记录
-        //                 for r in &all_added{
-        //                     let op: i32 = DataOperation::Added.into();
-        //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, refno: {}, pgno:{}, offset:{}, op: {} }}",
-        //                                              ses_id, index, r, ses_id, refno.to_pe_key(), pgno, offset, op));
-        //                 }
-        //                 //既不是新增，又不是删除，那就是修改
-        //                 if !all_added.contains(&refno) && !all_deleted.contains(&refno) {
-        //                     let op: i32 = DataOperation::Modified.into();
-        //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, pgno:{}, offset:{}, op: {} }}",
-        //                                              ses_id, index, refno, ses_id, pgno, offset, op));
-        //                 }
-        //
-        //                 //修改的需要去比对属性数据
-        //
-        //                 if !all_deleted.is_empty() || !all_added.is_empty() {
-        //                     println!("{refno}_{pgno}: {:?}", prev_children);
-        //                     println!("{refno}_{pgno}: {:?}", data.children);
-        //                     println!("Deleted: {:?}", &all_deleted);
-        //                     println!("Added: {:?}", &all_added);
-        //                     //todo 需要将这个 relate 关系加回去，同时创建 pe，并设置为 delete
-        //                     //todo 怎么查询这个构件是什么时候删除的呢，需要关联操作日志
-        //                 }
-        //                 prev_children = data.children.clone();
         //             }
-        //             // if prev_children == data.children {
-        //             //     //新加的部分也要放在pe_relate里去
-        //             // }else{
-        //             //     prev_children = data.children.clone();
-        //             // }
-        //             all_pes.push(pe);
-        //             type_att_map.entry(att.get_type()).or_insert(Vec::new()).push(data);
-        //         }else{
-        //             dbg!((pgno, offset));
-        //             break;
+        //             SesSqlType::PeHJson(values) => {
+        //                 for chunk in values.chunks(1){
+        //                     let sql = format!("INSERT INTO pe [{}];", chunk.join(","));
+        //                     println!("pe sql: {}", &sql);
+        //                     SUL_DB.query(sql).await.unwrap();
+        //                 }
+        //             }
+        //             _ => {}
         //         }
         //     }
-        //
-        //
-        //
-        //     if !ses_relates.is_empty(){
-        //         let relate_sql = format!("INSERT RELATION INTO ses_pe_relate [{}];", ses_relates.join(","));
-        //         // let relate_sql = format!("UPSERT RELATION INTO ses_pe_relate [{}];", all_relates.join(","));
-        //         // println!("relates: {}", &relate_sql);
-        //         SUL_DB.query(relate_sql).await.unwrap();
-        //     }
-        //
-        //     for chunk in all_pes.chunks(1000){
-        //         let mut jsons = vec![];
-        //         for pe in chunk{
-        //             jsons.push(pe.gen_sur_json(Some(pe.history_id())));
+        // });
+
+        // for (refno, offset_set) in &history_pe_map {
+        //     dbg!(refno);
+        //     for &offset in offset_set {
+        //         let ele_data = self.get_element(offset).await?;
+        //         let att = ele_data.att_map();
+        //         let pe = att.pe(dbnum);
+        //         //根据 offset，可以得到 sesno
+        //         let Some(sesno) = self.get_sesno((offset / 0x800) as _) else{
+        //             continue;
+        //         };
+        //         let json = pe.gen_sur_json_with_sesno(sesno as _);
+        //         all_his_pe_json.push(json);
+        //         if all_his_pe_json.len() > 1 {
+        //             dbg!(&all_his_pe_json);
+        //             match tx.send(SesSqlType::PeHJson(std::mem::take(&mut all_his_pe_json))) {
+        //                 Ok(_) => {}
+        //                 Err(e) => {
+        //                     dbg!(&e);
+        //                 }
+        //             }
         //         }
-        //         let sql = format!("INSERT IGNORE INTO pe_history [{}];", jsons.join(","));
-        //         // println!("insert sql is {}", &sql);
-        //         SUL_DB.query(sql).await.unwrap();
+        //         // dbg!((offset, offset / 0x800, sesno));
+        //         //保存 pe_owner history 的 relate 关系, owner 的 relate 关系 pe->owner
+        //         let children = &ele_data.children;
+        //         for (index, &child) in children.iter().enumerate(){
+        //             let child_sesno = Self::query_refno_sesno(child, sesno, dbnum).await?;
+        //             //child id 需要去 pe_ses 里查询得到最近的那个版本
+        //             if child_sesno != 0 {
+        //                 pe_owner_h_relates.push(
+        //                     format!(r#"{{ id: pe_owner:['{0}_{sesno}', {index}], in: pe:['{1}',{child_sesno}], out: pe:['{0}', {sesno}] }}"#,
+        //                     refno, child)
+        //                 );
+        //             }
+        //             else{
+        //                 dbg!((child, child_sesno, refno, sesno));
+        //                 pe_owner_h_relates.push(
+        //                     format!(r#"{{ id: pe_owner:['{0}_{sesno}', {index}], in: pe:{1}, out: pe:['{0}', {sesno}] }}"#,
+        //                     refno, child)
+        //                 );
+        //             }
+        //         }
+
         //     }
-        //
-        //     if found{
+        //     if pe_owner_h_relates.len() > 100 {
+        //         tx.send(SesSqlType::PeOwnerSql(std::mem::take(&mut pe_owner_h_relates)));
+        //     }
+        // }
+        // if pe_owner_h_relates.len() > 0 {
+        //     tx.send(SesSqlType::PeOwnerSql(pe_owner_h_relates));
+        // }
+        // if all_his_pe_json.len() > 0 {
+        //     tx.send(SesSqlType::PeHJson(all_his_pe_json));
+        // }
+        // //关闭 channel
+        // drop(tx);
+        // handle.await.unwrap();
+        Ok(())
+    }
+
+    //todo 可以指定 sesno 的范围去更新历史数据
+    pub async fn total_sync_history(&mut self) -> anyhow::Result<()> {
+        let history_pe_map = self.store_all_refno_sesno_map().await?;
+        dbg!(&history_pe_map.len());
+        // 遍历所有的 offset, 读取属性数据，得到 attmap
+        // let mut ses_map = HashMap::new();
+        let dbnum = self.dbnum;
+        let mut pe_owner_h_relates = Vec::new();
+        let mut all_his_pe_json = Vec::new();
+        let mut all_his_att_json_map: HashMap<String, Vec<String>> = HashMap::new();
+        let mut pe_op_map: HashMap<RefnoEnum, EleOperation> = HashMap::new();
+        let mut ses_op_map: HashMap<u32, Vec<EleOperation>> = HashMap::new();
+        let debug_refno: RefU64 = "17496_171606".into();
+        for (&refno, offset_set) in &history_pe_map {
+            let is_debug = debug_refno == refno;
+            let mut prev_children = Vec::new();
+            let mut prev_att_json = None;
+            let loc_len = offset_set.len();
+            for (i, &offset) in offset_set.iter().enumerate() {
+                //根据 offset，可以得到 sesno
+                // todo 改成使用宏
+                let Some(sesno) = self.get_sesno((offset / 0x800) as _) else {
+                    continue;
+                };
+                // 只有一个版本的情况，直接添加，都是最新的
+                if is_debug {
+                    dbg!(sesno);
+                    dbg!(offset_set.len());
+                } else {
+                    continue;
+                }
+                if loc_len == 1 {
+                    ses_op_map.entry(sesno).or_default().push(EleOperation::Add);
+                    break;
+                }
+                let is_last = i == loc_len - 1;
+                let ele_data = self.get_element(offset).await?;
+                let att = ele_data.att_map();
+                let mut pe = att.pe(dbnum);
+
+                //如果是第二个 json 开始，都是 modified
+                //todo需要实际检查是否真的 json 数据发生变化
+                if prev_att_json.is_some() {
+                    let refno_sesno = RefnoSesno::new(refno, sesno);
+                    if is_last {
+                        pe_op_map.insert(refno.into(), EleOperation::Modified);
+                    } else {
+                        pe_op_map.insert(refno_sesno.into(), EleOperation::Modified);
+                    }
+                    ses_op_map
+                        .entry(sesno)
+                        .or_default()
+                        .push(EleOperation::Modified);
+                } else {
+                    ses_op_map.entry(sesno).or_default().push(EleOperation::Add);
+                }
+                //如果是最后一个参考号的位置，直接退出，不用去保存到历史数据，因为是最新的数据
+                if is_last {
+                    break;
+                }
+
+                //和 prev_children 对比，如果在 prev 不在 current，则为删除，在 current，不在 prev，则为新增
+                for &child in ele_data.children.iter() {
+                    let refno_sesno = RefnoSesno::new(child, sesno);
+                    //如果是 add，在当前 sesno 一定会有
+                    if !prev_children.contains(&child) {
+                        //默认其实就是 add
+                        pe_op_map.insert(refno_sesno.into(), EleOperation::Add);
+                        ses_op_map.entry(sesno).or_default().push(EleOperation::Add);
+                    }
+                }
+                for &child in prev_children.iter() {
+                    let refno_sesno = RefnoSesno::new(child, sesno);
+                    //如果是 add，在当前 sesno 一定会有
+                    if !ele_data.children.contains(&child) {
+                        pe_op_map.insert(refno_sesno.into(), EleOperation::Deleted);
+                        ses_op_map
+                            .entry(sesno)
+                            .or_default()
+                            .push(EleOperation::Deleted);
+                    }
+                }
+
+                //需要获得这个属性里所有是参考号的对应的 sesno
+                let mut refno_sesno_map = HashMap::new();
+                for (name, value) in &att.map {
+                    if let NamedAttrValue::RefU64Type(refno) = value {
+                        if let Ok((sesno, is_latest_pe)) = Self::query_refno_sesno(*refno, sesno, dbnum).await {
+                            if !is_latest_pe {
+                                refno_sesno_map.insert(*refno, sesno);
+                            }
+                        }
+                    } else if let NamedAttrValue::RefU64Array(refnos) = value {
+                        for &refno in refnos {
+                            if let Ok((sesno, is_latest_pe)) = Self::query_refno_sesno(refno, sesno, dbnum).await {
+                                if !is_latest_pe {
+                                    refno_sesno_map.insert(refno, sesno);
+                                }
+                            }
+                        }
+                    }
+                }
+                let owner_sesno = refno_sesno_map.get(&pe.owner).cloned().unwrap_or(0);
+                let pe_json = pe.gen_sur_json_with_sesno(sesno as _, owner_sesno as _);
+                all_his_pe_json.push(pe_json);
+                let Some(att_json) = att.gen_sur_json_with_sesno(sesno as _, &refno_sesno_map)
+                else {
+                    continue;
+                };
+                prev_att_json = Some(att_json.clone());
+                //todo 如果没有真的发生变化，其实可以不保存这个数据
+                all_his_att_json_map
+                    .entry(att.get_type())
+                    .or_default()
+                    .push(att_json);
+                if all_his_pe_json.len() > 100 {
+                    println!("all_his_pe_json: {}", &all_his_pe_json.len());
+                    //直接执行 sql
+                    let sql = format!("INSERT INTO pe [{}];", all_his_pe_json.join(","));
+                    SUL_DB.query(sql).await.unwrap();
+                    all_his_pe_json.clear();
+                }
+                // dbg!((offset, offset / 0x800, sesno));
+                //保存 pe_owner history 的 relate 关系, owner 的 relate 关系 pe->owner
+                let children = &ele_data.children;
+                for (index, &child) in children.iter().enumerate() {
+                    let (child_sesno, is_latest_pe) = Self::query_refno_sesno(child, sesno, dbnum).await?;
+                    //child id 需要去 pe_ses 里查询得到最近的那个版本
+                    //如果是历史数据，加上 old 的标签
+                    if child_sesno != 0 && !is_latest_pe {
+                        pe_owner_h_relates.push(
+                            format!(r#"{{ id: pe_owner:['{0}_{sesno}', {index}], in: pe:['{1}, old: true',{child_sesno}],
+                                out: pe:['{0}', {sesno}] }}"#,
+                                    refno, child)
+                        );
+                    } else {
+                        dbg!((child, child_sesno, refno, sesno));
+                        pe_owner_h_relates.push(
+                            format!(r#"{{ id: pe_owner:['{0}_{sesno}', {index}], in: pe:{1}, out: pe:['{0}', {sesno}], old: true }}"#,
+                                    refno, child)
+                        );
+                    }
+                }
+                prev_children = children.to_vec();
+            }
+            if pe_owner_h_relates.len() > 100 {
+                println!("pe_owner_h_relates: {}", &pe_owner_h_relates.len());
+                //直接执行 sql
+                let sql = format!(
+                    "INSERT RELATION INTO pe_owner [{}];",
+                    pe_owner_h_relates.join(",")
+                );
+                SUL_DB.query(sql).await.unwrap();
+                pe_owner_h_relates.clear();
+            }
+        }
+        if pe_owner_h_relates.len() > 0 {
+            println!("pe_owner_h_relates: {}", &pe_owner_h_relates.len());
+            //直接执行 sql
+            let sql = format!(
+                "INSERT RELATION INTO pe_owner [{}];",
+                pe_owner_h_relates.join(",")
+            );
+            // println!("relation sql is {}", sql);
+            SUL_DB.query(sql).await.unwrap();
+        }
+        if all_his_pe_json.len() > 0 {
+            println!("all_his_pe_json: {}", &all_his_pe_json.len());
+            //直接执行 sql
+            let sql = format!("INSERT INTO pe [{}];", all_his_pe_json.join(","));
+            SUL_DB.query(sql).await.unwrap();
+        }
+        //保存历史属性数据
+        for (att_type, att_jsons) in all_his_att_json_map {
+            //使用 chunk
+            for chunk in att_jsons.chunks(100) {
+                let sql = format!("INSERT INTO {}_H [{}];", att_type, chunk.join(","));
+                SUL_DB.query(sql).await.unwrap();
+            }
+        }
+
+        //执行 pe_op_map, 更新 pe 数据
+        //update 这三个数量到 ses 表
+        let dbnum = self.dbnum;
+        for (sesno, ops) in ses_op_map {
+            let add_cnt = ops.iter().filter(|op| **op == EleOperation::Add).count();
+            let mod_cnt = ops
+                .iter()
+                .filter(|op| **op == EleOperation::Modified)
+                .count();
+            let del_cnt = ops
+                .iter()
+                .filter(|op| **op == EleOperation::Deleted)
+                .count();
+            let sql = format!(
+                "UPDATE ses:[{dbnum}, {sesno}] set add_cnt={}, mod_cnt={}, del_cnt={};",
+                add_cnt, mod_cnt, del_cnt
+            );
+            SUL_DB.query(sql).await.unwrap();
+        }
+        //update 这三个状态到pe 表
+        for (refno_sesno, op) in pe_op_map {
+            let sql = format!(
+                "UPSERT {} set op={};",
+                refno_sesno.to_pe_key(),
+                // refno_sesno.sesno,
+                op.into_num()
+            );
+            SUL_DB.query(sql).await.unwrap();
+        }
+        Ok(())
+    }
+
+    /// 通过数据库查询refno离参考 sesno 最近的 sesno 数据
+    pub async fn query_refno_sesno(refno: RefU64, sesno: u32, dbnum: i32) -> anyhow::Result<(u32, bool)> {
+        let sql = format!(
+            "fn::latest_pe_sesno({}, {}, {})",
+            refno.to_pe_key(),
+            sesno,
+            dbnum
+        );
+        let mut response = SUL_DB.query(&sql).await?;
+        let sesno: Option<(u32, bool)> = response.take(0).unwrap();
+        Ok(sesno.unwrap_or_default())
+    }
+
+    /// 同步所有 session 数据到数据库
+    //todo add some date filter ? session filter
+    pub async fn total_sync_sessions_to_db(&mut self) -> anyhow::Result<()> {
+        // use itertools::Itertools;
+
+        // //删除所有的历史数据
+        // SUL_DB.query("DELETE  e3d_ses;").await.unwrap();
+        // SUL_DB.query("DELETE  pe_h;").await.unwrap();
+        // SUL_DB.query("DELETE  ses_pe_relate;").await.unwrap();
+
+        // let pdms_header = self.read_pdms_header().unwrap();
+        // let dbnum = pdms_header.db_num;
+        // let mut cur_ses_pgno = pdms_header.latest_ses_pgno;
+        // let project = self.project.clone();
+
+        // //显示出有哪些修改，使用 json diff 工具
+        // let mut step = 0;
+        // //遍历整个文件数据, 从最新的最前的遍历
+        // let mut latest_refno_map = DashMap::new();
+        // let mut all_children_map: DashMap<RefU64, RefU64Vec> = DashMap::new();
+        // let mut all_relates = Vec::new();
+        // //pe_owner_h 的添加
+        // while cur_ses_pgno > 4 {
+        //     //数据还是跟 pgno ?
+        //     // let all_ents_in_ses = self.collect_refno_los_in_session(cur_ses_pgno as _).await;
+        //     //历史数据是否需要存储的问题？
+        //     // dbg!(&all_ents_in_ses);
+        //     let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
+        //     // dbg!(all_locs.len());
+
+        //     let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
+        //     //保存session 数据
+        //     // Self::save_ses_data(&pdms_header, &project, &cur_ses_page).await;
+
+        //     let mut all_his_att_sql = String::new();
+        //     let mut all_his_pe_sql = String::new();
+        //     let mut ses_relates = Vec::new();
+        //     let sesno = cur_ses_page.sesno;
+        //     // let ses_str = cur_ses_page.get_id(pdms_header.db_num);
+        //     for (i, loc) in all_locs.iter().enumerate() {
+        //         //如果是最新的，就不需要加版本后缀
+        //         //如果是历史版本，就需要有历史后缀，简单点就是是否之后出现过
+        //         let refno = loc.get_refno();
+        //         let offset = loc.offset;
+        //         //从后往前找的天然优势，就是后面的永远是最新的，如果发现历史的数据了，就加上版本号
+        //         let is_latest = !latest_refno_map.contains_key(&refno);
+        //         let pe_id = if is_latest {
+        //             format!("pe:{}", refno)
+        //         } else {
+        //             format!("pe:['{}',{}]", refno, sesno)
+        //         };
+        //         // all_relates.push(format!(
+        //         //     "{{ id:[e3d_ses:{}, {i}], in: {}, out: e3d_ses:{}, pgno:{}, offset:{} }}",
+        //         //     ses_str, &pe_id, ses_str, loc.pgno, loc.offset
+        //         // ));
+        //         //先暂时不管引用的数据？如果是引用的，需要先按 sesno 查询到当前对应的数据，
+        //         //可以用 id 扫描的办法，得到最新的数据？
+        //         if let Ok(ele_data) = self.get_element(loc.get_att_offset()).await {
+        //             let att = ele_data.att_map();
+        //             // all_children_map.entry(refno);
+        //             if !is_latest {
+        //                 //如果是历史数据，版本号加上
+        //                 let json = att
+        //                     .gen_sur_json_with_id(format!("['{}',{}]", refno.to_string(), sesno))
+        //                     .unwrap();
+        //                 let sql = format!("INSERT INTO {}_H {};", att.get_type_str(), &json);
+        //                 all_his_att_sql.push_str(&sql);
+        //                 let pe_sql = format!(
+        //                     "INSERT INTO pe_h {};",
+        //                     att.pe(dbnum).gen_sur_json_with_sesno(sesno)
+        //                 );
+        //                 // println!("pe sql: {}", &pe_sql);
+        //                 all_his_pe_sql.push_str(&pe_sql);
+        //                 //如果有历史 children 数据，而且 children 数据和当前的不一致，需要列出来哪些是新增的，那些是删除的
+        //                 if let Some(old_children) = all_children_map.get(&refno) {
+        //                     let mut new_children = &ele_data.children;
+        //                     let mut all_deleted = old_children
+        //                         .iter()
+        //                         .cloned()
+        //                         .filter(|x| !new_children.contains(x))
+        //                         .collect::<BTreeSet<_>>();
+        //                     let mut all_added = new_children
+        //                         .iter()
+        //                         .cloned()
+        //                         .filter(|x| !old_children.contains(x))
+        //                         .collect::<BTreeSet<_>>();
+        //                     for r in &all_deleted {
+        //                         let op: i32 = DataOperation::Deleted.into();
+        //                         ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, refno: {}, offset:{}, op: {} }}",
+        //                                                  sesno, i, r, sesno, refno.to_pe_key(), offset, op));
+        //                     }
+
+        //                     for r in &all_added {
+        //                         let op: i32 = DataOperation::Added.into();
+        //                         ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, refno: {}, offset:{}, op: {} }}",
+        //                             sesno, i, r, sesno, refno.to_pe_key(), offset, op));
+        //                     }
+
+        //                     if !all_deleted.is_empty() || !all_added.is_empty() {
+        //                         println!("{sesno} Deleted: {:?}", &all_deleted);
+        //                         println!("{sesno} Added: {:?}", &all_added);
+        //                     }
+        //                 }
+        //             }
+        //             //如果是最新的数据，就保存起来
+        //             all_children_map.insert(refno, ele_data.children);
+        //         }
+        //         latest_refno_map.entry(refno).or_insert_with(|| loc.clone());
+        //     }
+        //     // println!("hist att sql: {}", &all_his_att_sql);
+        //     //保存历史属性数据
+        //     SUL_DB.query(all_his_att_sql).await.unwrap();
+        //     SUL_DB.query(all_his_pe_sql).await.unwrap();
+        //     println!("会话: {:#4X?} 保存完毕", cur_ses_pgno);
+
+        //     //直接通过数据库查是否最新？还是通过文件查找？
+        //     //每个参考号都去拉取一遍，然后看看是不是最新的？
+
+        //     // let offset = cur_ses_page.end_pgno * 0x800 + 0x4;
+        //     // let bytes = io.read_bytes(offset, 4).unwrap();
+        //     // let type_name = db1_dehash(u32::from_be_bytes(bytes.try_into().unwrap()));
+        //     // dbg!(type_name);
+        //     // println!("session pgno {:#4X}: {:#4X}", cur_ses_pgno, offset / 0x800);
+        //     // dbg!((cur_ses_no, offset));
+        //     // dbg!(cur_ses_page.last_ses_pageno);
+        //     if step == 50 {
         //         break;
         //     }
-        //     // let sql = format!("insert into {}_history [{}]",ele.
-        //     //                   jsons.join(","));
-        //     // //执行 sql
-        //     // SUL_DB.query(&sql).await.unwrap();
-        //     // }
-        //     // let max_pgno = kv.1.iter().max().unwrap();
-        //     // let eles = self.collect_eles_in_session(*max_pgno).await;
-        //     // println!("refno: {:#4X?}", refno);
-        //     // println!("max_pgno: {:#4X?}", max_pgno);
-        //     // println!("eles: {:#4X?}", eles.len());
-        //     // println!("eles: {:#4X?}", eles);
+        //     if cur_ses_page.last_ses_pageno < 0 {
+        //         break;
+        //     }
+        //     step += 1;
+        //     cur_ses_pgno = cur_ses_page.last_ses_pageno as _;
+        //     // dbg!(last_ses_no);
+        //     // dbg!(cur_ses_page.get_timestamp());
+        //     // dbg!(cur_ses_page.get_computer_name());
+        //     // dbg!(cur_ses_page.get_comments_name());
+
+        //     // break;
         // }
+
+        // Self::save_ses_pe_relates(&all_relates).await;
+
+        // return Ok(());
+
+        // //refno_pgnos_map 查询里面 value 最多的项
+        // // let max_history_refno = refno_pgnos_map.iter().max_by_key(|x| x.1.len());
+        // // dbg!(&max_history_refno);
+
+        // //pe_history
+        // //pe_owner history 是否有必要
+        // //pe_owner 始终是最新的数据
+        // //pe_owner_history  为  pe_history 之间的关联关系？也有可能是 pe
+        // //如果 children 发生变化，确实需要记录这个，如果 pe 里没有的，那就是在pe_history 里面
+        // //NOUN_history
+        // //保存历史属性数据到数据库
+        // let mut type_att_map = BTreeMap::new();
+        // let mut found = false;
+        // //e3d_session 是否要绑定一个Operation log 的指向，还是直接可以对比两个session 就可以得到？
+        // //但是这样没法实现参考号查询自己是啥时候发生删除的，或者修改的
+        // // let mut history_owner_map = HashMap::new();
+        // // for (&refno, locs) in &refno_pgnos_map {
+        // //     if locs.is_empty(){
+        // //         continue;
+        // //     }
+        // //     //表示有历史记录，后面存储的都是old data, 查询时需要和latest data 合着一起查询
+        // //     dbg!(locs.len());
+        // //     //（1）按着从小到大的顺序排列的，所以后面的是新的，可以判断构件是否被删除
+        // //     //如果是新增加的呢？怎么样维护这个是否新增的关系，这里就要比较这个 ses no 的关系了，在查询的时候，如果是按
+        // //     //历史记录查询，需要加个 sesno 的条件过滤，或者 pgno 的过滤，子节点的 pngo 不能超过某个pgno
+        // //     //删除了肯定是不能再加回去这个参考号的
+        // //     //是否需要弄个pe_history? 还是就放在 pe 里面？应该是都放在 pe 里，然后历史的数据需要加上，以为 pe 是唯一的
+        // //     //即使属性发生变化，也只是 pgno 的变化
+        // //     let mut prev_children = RefU64Vec::default();
+        // //     //todo 使用 chunk
+        // //     let mut ses_relates = Vec::new();
+        // //     let len = locs.len();
+        // //     let mut all_pes = Vec::new();
+        // //     //pe_owner 怎么处理？
+        // //     //解析时，要快速定位所在 sesno，要记录下来，设置到 pgno，现在不能用 pgno 了，sesno 更具有代表性
+        // //     for (index, (pgno, sesno, offset)) in locs.into_iter().enumerate() {
+        // //         let addr = *pgno as u64 * 0x800 + *offset as u64 * 2;
+        // //         if let Ok(mut data) = self.get_element(addr).await{
+        // //             let mut att = &mut data.whole_attmap.attmap;
+        // //             let mut pe = att.pe(dbnum);
+        // //             //需要在这里检测是否和上一个比，有 delete 的变化，也就是比较 children
+        // //             //检查 children 的数据是否发生变化
+        // //             if !data.children.is_empty(){
+        // //                 //如果在历史层级关系里没有查询到的，需要去 pe 里去找，如果 pe 里没有那就是真没有
+        // //                 //保存节点关系的历史记录
+        // //                 // let owner_id = pe.history_id();
+        // //                 // history_owner_map.insert((pe.refno, pgno, sesno), data.children.clone());
+        // //                 //TODO modified refnos
+        // //                 //过滤出删除的参考号
+        // //                 let all_deleted = prev_children.iter().cloned().filter(|x|{
+        // //                     !data.children.contains(x)
+        // //                 }).collect::<BTreeSet<_>>();
+        // //
+        // //                 //过滤出新增的参考号
+        // //                 let all_added = data.children.iter().cloned().filter(|x|{
+        // //                     !prev_children.contains(x)
+        // //                 }).collect::<BTreeSet<_>>();
+        // //                 let ses_id = format!("{}_{}_{:0>6}", project, dbnum, sesno);
+        // //                 //插入删除的操作记录
+        // //                 //将删除的 pe 要重新插入回去，然后设置为 deleted
+        // //                 for (j, r) in all_deleted.iter().enumerate(){
+        // //                     let op: i32 = DataOperation::Deleted.into();
+        // //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, op: {} }}",
+        // //                                              ses_id, len+j, r, ses_id, op));
+        // //                     //要读取到这个删除的 att
+        // //                     pe.deleted = true;
+        // //                     // all_deleted_pes.push(pe);
+        // //                 }
+        // //
+        // //                 //插入新增的增加的记录
+        // //                 for r in &all_added{
+        // //                     let op: i32 = DataOperation::Added.into();
+        // //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, refno: {}, pgno:{}, offset:{}, op: {} }}",
+        // //                                              ses_id, index, r, ses_id, refno.to_pe_key(), pgno, offset, op));
+        // //                 }
+        // //                 //既不是新增，又不是删除，那就是修改
+        // //                 if !all_added.contains(&refno) && !all_deleted.contains(&refno) {
+        // //                     let op: i32 = DataOperation::Modified.into();
+        // //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, pgno:{}, offset:{}, op: {} }}",
+        // //                                              ses_id, index, refno, ses_id, pgno, offset, op));
+        // //                 }
+        // //
+        // //                 //修改的需要去比对属性数据
+        // //
+        // //                 if !all_deleted.is_empty() || !all_added.is_empty() {
+        // //                     println!("{refno}_{pgno}: {:?}", prev_children);
+        // //                     println!("{refno}_{pgno}: {:?}", data.children);
+        // //                     println!("Deleted: {:?}", &all_deleted);
+        // //                     println!("Added: {:?}", &all_added);
+        // //                     //todo 需要将这个 relate 关系加回去，同时创建 pe，并设置为 delete
+        // //                     //todo 怎么查询这个构件是什么时候删除的呢，需要关联操作日志
+        // //                 }
+        // //                 prev_children = data.children.clone();
+        // //             }
+        // //             // if prev_children == data.children {
+        // //             //     //新加的部分也要放在pe_relate里去
+        // //             // }else{
+        // //             //     prev_children = data.children.clone();
+        // //             // }
+        // //             all_pes.push(pe);
+        // //             type_att_map.entry(att.get_type()).or_insert(Vec::new()).push(data);
+        // //         }else{
+        // //             dbg!((pgno, offset));
+        // //             break;
+        // //         }
+        // //     }
+        // //
+        // //
+        // //
+        // //     if !ses_relates.is_empty(){
+        // //         let relate_sql = format!("INSERT RELATION INTO ses_pe_relate [{}];", ses_relates.join(","));
+        // //         // let relate_sql = format!("UPSERT RELATION INTO ses_pe_relate [{}];", all_relates.join(","));
+        // //         // println!("relates: {}", &relate_sql);
+        // //         SUL_DB.query(relate_sql).await.unwrap();
+        // //     }
+        // //
+        // //     for chunk in all_pes.chunks(1000){
+        // //         let mut jsons = vec![];
+        // //         for pe in chunk{
+        // //             jsons.push(pe.gen_sur_json(Some(pe.history_id())));
+        // //         }
+        // //         let sql = format!("INSERT IGNORE INTO pe_history [{}];", jsons.join(","));
+        // //         // println!("insert sql is {}", &sql);
+        // //         SUL_DB.query(sql).await.unwrap();
+        // //     }
+        // //
+        // //     if found{
+        // //         break;
+        // //     }
+        // //     // let sql = format!("insert into {}_history [{}]",ele.
+        // //     //                   jsons.join(","));
+        // //     // //执行 sql
+        // //     // SUL_DB.query(&sql).await.unwrap();
+        // //     // }
+        // //     // let max_pgno = kv.1.iter().max().unwrap();
+        // //     // let eles = self.collect_eles_in_session(*max_pgno).await;
+        // //     // println!("refno: {:#4X?}", refno);
+        // //     // println!("max_pgno: {:#4X?}", max_pgno);
+        // //     // println!("eles: {:#4X?}", eles.len());
+        // //     // println!("eles: {:#4X?}", eles);
+        // // }
         //pe_owner_history 对pe 进行修正？还是直接存储这个children 关系？
         //先暂时不支持 relate 的历史纪录？还是反过来加入 relate 的 patch？
 
@@ -569,8 +1072,7 @@ impl PdmsIO {
         //     SUL_DB.query(relate_sql).await.unwrap();
         // }
 
-        Self::save_att_history(&mut type_att_map).await;
-
+        // Self::save_att_history(&mut type_att_map).await;
 
         Ok(())
     }
@@ -582,14 +1084,6 @@ impl PdmsIO {
             // println!("relates: {}", chunk.join(","));
             SUL_DB.query(relate_sql).await.unwrap();
         }
-    }
-
-    async fn save_ses_data(pdms_header: &PdmsHeader, project: &String, cur_ses_page: &SessionPageData) {
-        //先保存 session 数据到数据库
-        let sql = format!("insert into e3d_ses {}",
-                          cur_ses_page.gen_sur_json(project.as_str(), pdms_header.db_num));
-        //执行 sql
-        SUL_DB.query(&sql).await.unwrap();
     }
 
     async fn save_att_history(type_att_map: &mut BTreeMap<String, Vec<EleData>>) {
@@ -608,8 +1102,7 @@ impl PdmsIO {
                         jsons.push(json);
                     }
                 }
-                let sql = format!("insert into {}_history [{}]",
-                                  type_name, jsons.join(","));
+                let sql = format!("insert into {}_history [{}]", type_name, jsons.join(","));
                 SUL_DB.query(&sql).await.unwrap();
             }
         }
@@ -620,13 +1113,15 @@ impl PdmsIO {
     pub async fn compare_eles_between_sessions() {}
 
     #[inline]
-    pub fn get_ses_pageno(&self, sesno: i32) -> Option<u32>{
+    pub fn get_ses_pageno(&self, sesno: i32) -> Option<u32> {
         self.sesno_pgno_map.get(&sesno).cloned()
     }
 
     #[inline]
     pub fn collect_refno_locs(&mut self, sesno: i32) -> Vec<RefnoDataLoc> {
-        self.get_ses_pageno(sesno).map(|ses_pgno| self.collect_refno_locs_in_session(ses_pgno)).unwrap_or_default()
+        self.get_ses_pageno(sesno)
+            .map(|ses_pgno| self.collect_refno_locs_in_session(ses_pgno))
+            .unwrap_or_default()
     }
 
     pub fn collect_refno_locs_in_session(&mut self, ses_pgno: u32) -> Vec<RefnoDataLoc> {
@@ -648,7 +1143,13 @@ impl PdmsIO {
         // dbg!(index_data.level);
         let mut final_locs = vec![];
         let mut level = index_data.level as i32;
-        self.filter_index_data(&index_data, &mut final_locs, last_end_pgno, cur_end_pgno, &mut level);
+        self.filter_index_data(
+            &index_data,
+            &mut final_locs,
+            last_end_pgno,
+            cur_end_pgno,
+            &mut level,
+        );
 
         final_locs
     }
@@ -666,13 +1167,21 @@ impl PdmsIO {
     }
 
     ///过滤 index page data 里面的数据
-    pub fn filter_index_data(&mut self, index_data: &IndexPageData, result_locs: &mut Vec<RefnoDataLoc>,
-                             last_end_pgno: u32, cur_end_pgno: u32, level: &mut i32) -> Option<bool> {
+    pub fn filter_index_data(
+        &mut self,
+        index_data: &IndexPageData,
+        result_locs: &mut Vec<RefnoDataLoc>,
+        last_end_pgno: u32,
+        cur_end_pgno: u32,
+        level: &mut i32,
+    ) -> Option<bool> {
         // let mut level = index_data?.level as i32;
         if index_data.refno_locs.is_empty() {
             return None;
         }
-        let cur_locs = index_data.refno_locs.iter()
+        let cur_locs = index_data
+            .refno_locs
+            .iter()
             .filter(|x| x.pgno > last_end_pgno && x.pgno < cur_end_pgno)
             .map(|x| x.clone())
             .collect::<Vec<_>>();
@@ -696,7 +1205,13 @@ impl PdmsIO {
                         // dbg!((next_level, *level));
                         // dbg!((&l, next_index_data));
                     } else {
-                        self.filter_index_data(&next_index_data, result_locs, last_end_pgno, cur_end_pgno, &mut next_level);
+                        self.filter_index_data(
+                            &next_index_data,
+                            result_locs,
+                            last_end_pgno,
+                            cur_end_pgno,
+                            &mut next_level,
+                        );
                     }
                 }
             }
@@ -725,7 +1240,6 @@ impl PdmsIO {
         Ok(eles_map)
     }
 
-
     //直接读取中间这段数据的att index table，直接获取所有需要的数据
     pub async fn collect_increment_eles_old(
         &mut self,
@@ -736,7 +1250,8 @@ impl PdmsIO {
         let start = till_pageno as u64 * 0x800;
         #[cfg(feature = "debug_parse")]
         println!("Bytes start at : {:#04X?}", start);
-        file.seek(SeekFrom::Start(start)).expect("collect_increment_eles");
+        file.seek(SeekFrom::Start(start))
+            .expect("collect_increment_eles");
         file.read_to_end(&mut input)?;
         let mut pos_iter = rfind_iter(&input, &REFNO_LEAF_INDEX_PAGE[..]);
         // let mut max_pgno = 0;
@@ -752,13 +1267,13 @@ impl PdmsIO {
                 }
                 let refno_att_offset = x.get_att_offset();
                 #[cfg(feature = "debug_parse")]
-                println!("Found loc: {:#04X?}, att_offset: {:#04X}", &x, refno_att_offset);
+                println!(
+                    "Found loc: {:#04X?}, att_offset: {:#04X}",
+                    &x, refno_att_offset
+                );
                 let refno = RefU64::from_two_nums(x.refno_0, x.refno_1);
                 if !refno_data_offsets_map.contains_key(&refno) {
-                    refno_data_offsets_map.insert(
-                        refno,
-                        refno_att_offset,
-                    );
+                    refno_data_offsets_map.insert(refno, refno_att_offset);
                 }
             }
         }
@@ -887,4 +1402,21 @@ impl PdmsIO {
 
         Ok(true)
     }
+}
+
+pub async fn scan_all_history_data(path: &str) -> anyhow::Result<()> {
+    //先建立 ses 的索引，date 和 dbnum， sesno 都要建立索引
+    SUL_DB
+        .query(
+            r#"
+        DEFINE INDEX date_index ON ses COLUMNS date;
+        DEFINE INDEX dbnum_index ON ses COLUMNS dbnum;
+        DEFINE INDEX sesno_index ON ses COLUMNS sesno;
+    "#,
+        )
+        .await
+        .unwrap();
+    let mut io = PdmsIO::new("ams", path, true);
+    io.total_sync_history().await.unwrap();
+    Ok(())
 }

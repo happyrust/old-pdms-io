@@ -1,5 +1,6 @@
 use deku::bitvec::*;
 use deku::prelude::*;
+use surrealdb::sql::Thing;
 use std::convert::{TryFrom, TryInto};
 use aios_core::RefU64;
 use aios_core::tool::db_tool::decode_chars_data;
@@ -83,14 +84,19 @@ pub struct SessionPageData {
 impl SessionPageData {
 
     #[inline]
-    pub fn get_id(&self, project: &str, dbnum: i32) -> String {
-        format!("{}_{}_{:0>6}", project, dbnum, self.sesno)
+    pub fn get_id(&self, dbnum: i32) -> [i32; 2] {
+        [dbnum, self.sesno]
     }
 
-    pub fn gen_sur_json(&self, project: &str, dbnum: i32) -> String{
+    // #[inline]
+    // pub fn get_sur_id(&self, dbnum: i32) -> Thing {
+    //     Thing::from((String::from("ses"), self.get_id(dbnum)))
+    // }
+
+    pub fn gen_sur_json(&self, dbnum: i32) -> String{
         //id 需要拿 sesno 和 dbnum 组合？还是和文件名组合？
-        let id = self.get_id(project, dbnum);
-        let mut json = serde_json::json!({
+        let id = self.get_id(dbnum);
+        let json = serde_json::json!({
             "id": id,
             "sesno": self.sesno,
             "pgno": self.pgno,
