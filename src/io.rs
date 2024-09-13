@@ -428,7 +428,7 @@ impl PdmsIO {
     }
 
     //todo 可以指定 sesno 的范围去更新历史数据
-    pub async fn total_sync_history(&mut self) -> anyhow::Result<()> {
+    pub async fn sync_history(&mut self) -> anyhow::Result<()> {
         let history_pe_map = self.store_all_refno_sesno_map().await?;
         dbg!(&history_pe_map.len());
         // 遍历所有的 offset, 读取属性数据，得到 attmap
@@ -566,7 +566,7 @@ impl PdmsIO {
                                     refno, child)
                         );
                     } else {
-                        dbg!((child, child_sesno, refno, sesno));
+                        // dbg!((child, child_sesno, refno, sesno));
                         pe_owner_h_relates.push(
                             format!(r#"{{ id: pe_owner:['{0}_{sesno}', {index}], in: pe:{1}, out: pe:['{0}', {sesno}], old: true }}"#,
                                     refno, child)
@@ -1321,19 +1321,9 @@ impl PdmsIO {
     }
 }
 
-pub async fn scan_all_history_data(path: &str) -> anyhow::Result<()> {
+pub async fn sync_all_history_data(path: &str) -> anyhow::Result<()> {
     //先建立 ses 的索引，date 和 dbnum， sesno 都要建立索引
-    SUL_DB
-        .query(
-            r#"
-        DEFINE INDEX date_index ON ses COLUMNS date;
-        DEFINE INDEX dbnum_index ON ses COLUMNS dbnum;
-        DEFINE INDEX sesno_index ON ses COLUMNS sesno;
-    "#,
-        )
-        .await
-        .unwrap();
     let mut io = PdmsIO::new("ams", path, true);
-    io.total_sync_history().await.unwrap();
+    io.sync_history().await.unwrap();
     Ok(())
 }

@@ -21,7 +21,7 @@ async fn test_read_all_sessions() -> anyhow::Result<()>{
     let db_path = "D:/AVEVA/Projects/E3D2.1/AvevaMarineSample/ams000/ams1112_0001";
     #[cfg(target_os = "macos")]
     let db_path = "/Users/dongpengcheng/Documents/models/e3d_models/AvevaMarineSample/ams000/ams1112_0001";
-    crate::io::scan_all_history_data(db_path).await.unwrap();
+    crate::io::sync_all_history_data(db_path).await.unwrap();
 
     Ok(())
 }
