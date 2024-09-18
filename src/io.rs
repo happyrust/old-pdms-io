@@ -363,7 +363,9 @@ impl PdmsIO {
         // 跳过没有变化的数据，需要用个hash 来记录
         let mut latest_refno_map = DashMap::new();
         while cur_ses_pgno > 4 {
-            // dbg!(cur_ses_pgno);
+            // if cur_ses_pgno == 716 {
+            //     dbg!(cur_ses_pgno);
+            // }
             let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
             let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
             let sesno = cur_ses_page.sesno;
@@ -397,10 +399,6 @@ impl PdmsIO {
                     ses_id[0],
                     ses_id[1]
                 ));
-            }
-
-            if sesno == 897 {
-                dbg!(&pe_ses_sqls);
             }
             //按 chunks 保存数据
             if pe_ses_sqls.len() > 100 {
@@ -436,15 +434,20 @@ impl PdmsIO {
         let dbnum = self.dbnum;
         let mut pe_owner_h_relates = Vec::new();
         let mut all_his_pe_json = Vec::new();
+        let mut all_his_json = Vec::new();
+
         let mut all_his_att_json_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut pe_op_map: HashMap<RefnoEnum, EleOperation> = HashMap::new();
         let mut ses_op_map: HashMap<u32, Vec<EleOperation>> = HashMap::new();
-        let debug_refno: RefU64 = "17496_171606".into();
+        let debug_refno: RefU64 = "17496_100092".into();
+        //将历史纪录都存储在 his_relate 里， owner 为当前最新的 pe
+        //如果没有历史记录，则不存储，减小额外的存储
         for (&refno, offset_set) in &history_pe_map {
             let is_debug = debug_refno == refno;
             let mut prev_children = Vec::new();
             let mut prev_att_json = None;
             let loc_len = offset_set.len();
+            let mut all_sesnos = BTreeSet::new();
             for (i, &offset) in offset_set.iter().enumerate() {
                 //根据 offset，可以得到 sesno
                 // todo 改成使用宏
@@ -453,8 +456,9 @@ impl PdmsIO {
                 };
                 // 只有一个版本的情况，直接添加，都是最新的
                 // if is_debug {
+                //     dbg!(offset);
                 //     dbg!(sesno);
-                //     dbg!(offset_set.len());
+                //     dbg!(&offset_set);
                 // } else {
                 //     continue;
                 // }
@@ -468,6 +472,12 @@ impl PdmsIO {
                 };
                 let att = ele_data.att_map();
                 let mut pe = att.pe(dbnum);
+                if !is_last{
+                    all_sesnos.insert(sesno);
+                }
+                if is_debug {
+                    dbg!(&att);
+                }
 
                 //如果是第二个 json 开始，都是 modified
                 //todo需要实际检查是否真的 json 数据发生变化
@@ -540,6 +550,10 @@ impl PdmsIO {
                     continue;
                 };
                 prev_att_json = Some(att_json.clone());
+                //保存his_relate 数据
+                let ses_refno = RefnoSesno::new(refno, sesno);
+
+
                 //todo 如果没有真的发生变化，其实可以不保存这个数据
                 all_his_att_json_map
                     .entry(att.get_type())
@@ -575,6 +589,26 @@ impl PdmsIO {
                 }
                 prev_children = children.to_vec();
             }
+
+            //只存储历史的 refno纪录
+            if !all_sesnos.is_empty(){
+                let his_pe_keys = all_sesnos.iter().map(|sesno| format!("pe:['{}', {}]", refno, sesno)).collect::<Vec<_>>().join(",");
+                all_his_json.push(
+                    format!(
+                        r#"{{ id: his_pe:{0}, refnos: [{1}] }}"#,
+                        refno.to_string(), &his_pe_keys
+                    )
+                );
+            }
+
+            if all_his_json.len() > 100 {
+                let sql = format!("INSERT INTO his_pe [{}];", all_his_json.join(","));
+                SUL_DB.query(sql).await.unwrap();
+                all_his_json.clear();
+            }
+
+
+
             if pe_owner_h_relates.len() > 100 {
                 println!("pe_owner_h_relates: {}", &pe_owner_h_relates.len());
                 //直接执行 sql
@@ -600,7 +634,11 @@ impl PdmsIO {
             println!("all_his_pe_json: {}", &all_his_pe_json.len());
             //直接执行 sql
             let sql = format!("INSERT INTO pe [{}];", all_his_pe_json.join(","));
-            // println!("sql: {}", sql);
+            SUL_DB.query(sql).await.unwrap();
+        }
+        if all_his_json.len() > 0 {
+            let sql = format!("INSERT INTO his_pe [{}];", all_his_json.join(","));
+            // println!("sql: {}", &sql);
             SUL_DB.query(sql).await.unwrap();
         }
         //保存历史属性数据
@@ -1099,7 +1137,7 @@ impl PdmsIO {
         let cur_locs = index_data
             .refno_locs
             .iter()
-            .filter(|x| x.pgno > last_end_pgno && x.pgno < cur_end_pgno)
+            .filter(|x| x.pgno > last_end_pgno && x.pgno < cur_end_pgno && x.flag == 1)
             .map(|x| x.clone())
             .collect::<Vec<_>>();
         if cur_locs.is_empty() {

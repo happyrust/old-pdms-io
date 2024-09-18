@@ -222,7 +222,7 @@ pub struct RefnoDataLoc {
     #[deku(bits = "20")]
     pub offset: u32,
     #[deku(bits = "12")]
-    pub other: u16,
+    pub flag: u16,
 }
 
 impl RefnoDataLoc {
