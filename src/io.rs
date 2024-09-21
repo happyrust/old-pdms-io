@@ -606,19 +606,19 @@ impl PdmsIO {
         //检查 deleted_refnos 是否有在 add_only_refnos 中，如果有，则删除
         dbg!(&deleted_refnos_map);
         dbg!(&added_only_refnos_map.len());
+        let mut no_modify_delete_refnos_map = BTreeMap::new();
         if !deleted_refnos_map.is_empty() && !added_only_refnos_map.is_empty() {
-            let mut need_delete_refnos = Vec::new();
             for (&refno, &sesno) in &deleted_refnos_map {
                 if added_only_refnos_map.contains_key(&refno) {
                     let offset = added_only_refnos_map.remove(&refno).unwrap();
-                    need_delete_refnos.push((refno, sesno, offset));
+                    no_modify_delete_refnos_map.insert(refno, (sesno, offset));
                 }
             }
 
-            if !need_delete_refnos.is_empty() {
+            if !no_modify_delete_refnos_map.is_empty() {
                 // dbg!(&need_delete_refnos);
                 //只出现过一次，然后被判断为删除的，需要还原为原来的数据
-                for (refno, del_sesno, offset) in need_delete_refnos {
+                for (refno, (del_sesno, offset)) in no_modify_delete_refnos_map {
                     // SUL_DB.query(sql).await.unwrap();
                     // let sql = format!("UPSERT pe:['{}', {}]", refno.to_pe_key(), sesno);
                     // SUL_DB.query(sql).await.unwrap();
@@ -645,7 +645,7 @@ impl PdmsIO {
                         .or_default()
                         .push(att_json);
                     all_his_json.push(format!(
-                        r#"{{ id: his_pe:{0}, refnos: [pe:['{0}', {del_sesno}], pe:['{0}', {add_sesno}]] }}"#,
+                        r#"{{ id: his_pe:{0}, refnos: [pe:['{0}', {del_sesno}], pe:{0}] }}"#,
                         refno.to_string(),
                     ));
 
@@ -713,11 +713,28 @@ impl PdmsIO {
             if op == EleOperation::Add {
                 continue;
             }
-            let sql = format!(
-                "UPSERT {} set op={};",
-                refno_sesno.to_pe_key(),
-                op.into_num()
-            );
+            // let id = if no_modify_delete_refnos_map.contains_key(&refno_sesno.refno()) {
+            // let id = if op == EleOperation::Deleted {
+            //     //删除需要都更新到pe
+            //     refno_sesno.refno().to_pe_key()
+            // } else {
+            //     refno_sesno.to_pe_key()
+            // };
+            let id = refno_sesno.to_pe_key();
+            let sql = if refno_sesno.sesno().unwrap_or_default() == 0 {
+                format!(
+                    "UPSERT {} set op={};",
+                    id,
+                    op.into_num()
+                )
+            } else {
+                format!(
+                    "UPSERT {} set op={}, sesno={};",
+                    id,
+                    op.into_num(),
+                    refno_sesno.sesno().unwrap()
+                )
+            };
             SUL_DB.query(sql).await.unwrap();
         }
         Ok(())
