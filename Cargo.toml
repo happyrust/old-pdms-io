@@ -28,7 +28,7 @@ chrono = "0.4.31"
 surrealdb = { path = "../surrealdb/sdk", default-features = false, features = ["protocol-ws"]}
 reqwest = { version = "0.11.22", default-features = false, features = ["json", "rustls-tls"] }
 rayon = "1.8.0"
-dpcsync = { path = "../dpc-sync" }
+#dpcsync = { path = "../dpc-sync" }
 blake2 = "0.10.6"
 futures-util = "0.3.29"
 log = "0.4.20"

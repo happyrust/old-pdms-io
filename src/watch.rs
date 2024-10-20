@@ -12,11 +12,11 @@ use std::path::Path;
 use std::path::PathBuf;
 use walkdir::WalkDir;
 use dashmap::DashMap;
-use dpcsync::chunker;
+// use dpcsync::chunker;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
-use crate::sync::compress::{CompressOptions, execute_compress};
-use crate::sync::sync::compress_archive;
+// use crate::sync::compress::{CompressOptions, execute_compress};
+// use crate::sync::sync::compress_archive;
 
 #[test]
 fn test_watch() {
@@ -107,8 +107,8 @@ impl PdmsWatcher {
                 let output: PathBuf = format!("{}/{}.cba", cbas_dir_path.as_str(), file_name).into();
                 let tmp_path = cbas_dir_path.clone();
                 join_set.spawn(async move {
-                    let compress_opt = CompressOptions::new(input, output, tmp_path.as_str());
-                    execute_compress(compress_opt).await.unwrap();
+                    // let compress_opt = CompressOptions::new(input, output, tmp_path.as_str());
+                    // execute_compress(compress_opt).await.unwrap();
                 });
             }
             while let Some(_) = join_set.join_next().await {}

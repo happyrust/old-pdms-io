@@ -6,6 +6,7 @@ use aios_core::{
     RefnoEnum, RefnoSesno, SUL_DB,
 };
 use anyhow::anyhow;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::{FutureExt, StreamExt};
 use memchr::memmem::rfind_iter;
@@ -55,6 +56,7 @@ const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [
 enum SesSqlType {
     SesJson(Vec<String>),
     PeSesSql(Vec<String>),
+    PeVersionJson((Vec<String>, DateTime<Utc>)),
     PeHJson(Vec<String>),
     PeOwnerSql(Vec<String>),
 }
@@ -352,7 +354,7 @@ impl PdmsIO {
                     SesSqlType::SesJson(values) => {
                         for chunk in values.chunks(100) {
                             //插入 json 数据
-                            let sql = format!("INSERT IGNORE INTO  ses [{}];", chunk.join(","));
+                            let sql = format!("INSERT IGNORE INTO ses [{}];", chunk.join(","));
                             // println!("ses sql: {}", &sql);
                             SUL_DB.query(sql).await.unwrap();
                         }
@@ -363,6 +365,14 @@ impl PdmsIO {
                             SUL_DB.query(sql).await.unwrap();
                         }
                     }
+                    SesSqlType::PeVersionJson((values, dt)) => {
+                        for chunk in values.chunks(100){
+                            let sql = format!("INSERT IGNORE INTO pe [{}] VERSION {};", 
+                                chunk.join(","), dt.to_rfc3339());
+                            SUL_DB.query(sql).await.unwrap();
+                        }
+                        
+                    }
                     _ => {}
                 }
             }
@@ -371,16 +381,10 @@ impl PdmsIO {
         // 跳过没有变化的数据，需要用个hash 来记录
         let mut latest_refno_map = DashMap::new();
         while cur_ses_pgno > 4 {
-            // if cur_ses_pgno == 716 {
-            //     dbg!(cur_ses_pgno);
-            // }
             let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
             let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
             let sesno = cur_ses_page.sesno;
-            // dbg!(sesno);
-            // if sesno < 730 {
-            //     break;
-            // }
+            let cur_dt = cur_ses_page.get_dt();
             let ses_id = cur_ses_page.get_id(dbnum);
             tx.send(SesSqlType::SesJson(vec![cur_ses_page.gen_sur_json(dbnum)]));
 
@@ -390,6 +394,16 @@ impl PdmsIO {
                 let Some(sesno) = self.get_sesno((offset / 0x800) as _) else {
                     continue;
                 };
+
+                //将所有数据都保存到 kv 数据库中，方便版本历史的查询
+                //todo 单独存储到数据库
+                // let Ok(ele_data) = self.get_element(offset).await else {
+                //     continue;
+                // };
+                // let att = ele_data.att_map();
+                // let mut pe = att.pe(dbnum);
+                // tx.send(SesSqlType::PeVersionJson((vec![pe.gen_sur_json(None)], cur_dt)));
+
                 //需要记录所有的 offset 数据，如果有两个以上的，代表有历史数据，需要在后面做比较
                 //根据读取的数据判断是否有增删改
                 history_loc_map
@@ -641,7 +655,7 @@ impl PdmsIO {
             }
         }
         //检查 deleted_refnos 是否有在 add_only_refnos 中，如果有，则删除
-        dbg!(&deleted_refnos_map);
+        // dbg!(&deleted_refnos_map);
         dbg!(&added_only_refnos_map.len());
         let mut no_modify_delete_refnos_map = BTreeMap::new();
         if !deleted_refnos_map.is_empty() && !added_only_refnos_map.is_empty() {
