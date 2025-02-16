@@ -57,14 +57,14 @@ batch_insert_sql_cnt = 100 #mysql 批量插入的数量
 
 #版本数据库服务配置
 v_ip = "localhost"
-#v_port = "8004"
-#v_port = "8003"
 v_port = "8008"
 v_user = "root"
 v_password = "root"
 pe_chunk = 500
 att_chunk = 200
 
+kv_ip = "localhost"
+kv_port = "8010"
 
 #mqtt 事件 ip
 mqtt_host = "192.168.31.60"

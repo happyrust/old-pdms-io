@@ -1,22 +1,23 @@
-use std::fs::File;
-use std::io::{Read, Write};
 use crate::defines::{DbPageBasicInfo, PdmsHeader};
 use crate::io::PdmsIO;
+use dashmap::DashMap;
 use futures::{
     channel::mpsc::{channel, Receiver},
-    SinkExt, StreamExt, future::ok,
+    future::ok,
+    SinkExt, StreamExt,
 };
 use indexmap::IndexMap;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use walkdir::WalkDir;
-use dashmap::DashMap;
-use dpcsync::chunker;
+// use dpcsync::chunker;
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
-use crate::sync::compress::{CompressOptions, execute_compress};
-use crate::sync::sync::compress_archive;
+// use crate::sync::compress::{CompressOptions, execute_compress};
+// use crate::sync::sync::compress_archive;
 
 #[test]
 fn test_watch() {
@@ -60,6 +61,10 @@ impl PdmsWatcher {
         Ok(())
     }
 
+    pub fn get_dbno(&self, path: &PathBuf) -> Option<u32> {
+        self.headers.get(path).map(|x| x.pdms_header.db_num as u32)
+    }
+
     // pub fn load_from_json(path: Option<&str>) -> anyhow::Result<Self> {
     //     let mut file = File::open(path.unwrap_or("watcher.json"))?;
     //     let mut string = String::new();
@@ -88,27 +93,32 @@ impl PdmsWatcher {
                 let dir_entry = entry.unwrap();
                 let path = dir_entry.path();
                 let file_name = path.file_stem().unwrap().to_str().unwrap();
-                if path.is_dir(){
+                if path.is_dir() {
                     continue;
                 }
-                self.file_name_full_path_map.insert(file_name.to_owned(), path.to_path_buf());
+                self.file_name_full_path_map
+                    .insert(file_name.to_owned(), path.to_path_buf());
                 let mut io = PdmsIO::new("ams", path, true);
                 io.open().unwrap();
                 if let Ok(basic_info) = io.get_page_basic_info() {
                     if let Some(old) = self.headers.get_mut(&path.to_path_buf()) {
                         //未发生修改，直接跳过
-                        if old.pdms_header.latest_ses_pgno == basic_info.pdms_header.latest_ses_pgno { continue; }
+                        if old.pdms_header.latest_ses_pgno == basic_info.pdms_header.latest_ses_pgno
+                        {
+                            continue;
+                        }
                     }
                     self.headers.insert(path.to_path_buf(), basic_info);
                 }
 
                 //初始化CBA的Archive文件，来保证后续增量下载
-                let input= path.to_path_buf();
-                let output: PathBuf = format!("{}/{}.cba", cbas_dir_path.as_str(), file_name).into();
+                let input = path.to_path_buf();
+                let output: PathBuf =
+                    format!("{}/{}.cba", cbas_dir_path.as_str(), file_name).into();
                 let tmp_path = cbas_dir_path.clone();
                 join_set.spawn(async move {
-                    let compress_opt = CompressOptions::new(input, output, tmp_path.as_str());
-                    execute_compress(compress_opt).await.unwrap();
+                    // let compress_opt = CompressOptions::new(input, output, tmp_path.as_str());
+                    // execute_compress(compress_opt).await.unwrap();
                 });
             }
             while let Some(_) = join_set.join_next().await {}
@@ -116,7 +126,6 @@ impl PdmsWatcher {
 
         anyhow::Ok(())
     }
-
 
     ///扫描出来每个db文件的 header信息
     pub fn scan_db_headers<P: AsRef<Path>>(
@@ -135,7 +144,9 @@ impl PdmsWatcher {
         Ok(result)
     }
 
-    pub fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)> {
+    ///创建一个异步的watcher
+    pub fn async_watcher() -> notify::Result<(RecommendedWatcher, Receiver<notify::Result<Event>>)>
+    {
         let (mut tx, rx) = channel(1);
 
         // Automatically select the best implementation for your platform.
@@ -152,4 +163,3 @@ impl PdmsWatcher {
         Ok((watcher, rx))
     }
 }
-

@@ -106,13 +106,13 @@ impl SessionPageData {
             "end_pgno": self.end_pgno,
             "computer_name": self.get_computer_name(),
             "comments": self.get_comments_name(),
-            "date": self.get_timestamp().to_rfc3339(),
+            "date": self.get_dt().to_rfc3339(),
         });
         json.to_string()
     }
 
     #[inline]
-    pub fn get_timestamp(&self) -> DateTime<Utc> {
+    pub fn get_dt(&self) -> DateTime<Utc> {
         let year = self.year;
         let month = self.month;
         let days = self.hours / 24;
@@ -222,7 +222,7 @@ pub struct RefnoDataLoc {
     #[deku(bits = "20")]
     pub offset: u32,
     #[deku(bits = "12")]
-    pub other: u16,
+    pub flag: u16,
 }
 
 impl RefnoDataLoc {
