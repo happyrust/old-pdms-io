@@ -5,7 +5,7 @@ pub mod defines;
 pub mod common;
 pub mod test;
 
-// pub mod sync;
+pub mod sync;
 
 pub mod watch;
 
