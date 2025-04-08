@@ -315,6 +315,27 @@ impl PdmsIO {
         }
     }
 
+    /// 获取最接近指定会话号的有效会话号
+    ///
+    /// # 参数
+    /// * `sesno` - 目标会话号
+    ///
+    /// # 返回值
+    /// * 如果存在大于等于目标会话号的最小会话号,返回该会话号
+    /// * 否则返回最大的会话号
+    /// * 如果没有任何会话号,返回原始会话号
+    pub fn get_nearest_sesno(&mut self, sesno: i32) -> anyhow::Result<i32> {
+        let mut near_sesno = 0;
+        // 查找大于等于目标会话号的最小会话号
+        if let Some(next_sesno) = self.sesno_pgno_map.keys().filter(|&&s| s >= sesno).min() {
+            near_sesno = *next_sesno;
+        // 如果没有找到,则返回最大的会话号
+        } else if let Some(&last_sesno) = self.sesno_pgno_map.keys().max() {
+            near_sesno = last_sesno;
+        }
+        Ok(near_sesno)
+    }
+
     #[inline]
     pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<IndexPageData> {
         let file = self.get_file()?;

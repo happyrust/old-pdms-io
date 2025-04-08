@@ -1,10 +1,10 @@
 #同步文件配置
-total_sync = false
+total_sync = true
 #增量同步，避免重新创建重复的索引和uda、sys
 incr_sync = false
 enable_log = false
 sync_graph_db = false
-sync_versioned = false
+sync_versioned = true
 sync_tidb = false
 sync_localdb = false
 replace_dbs = false
@@ -90,10 +90,10 @@ only_rebuild_pdms_element = false
 
 debug_refno_types = ["CATA", "LOOP", "PRIM"]
 #debug_refno_types = ["LOOP"]
-included_db_files = ["ams7999_0001"]
+# included_db_files = ["ams7999_0001"]
 #included_db_files = ["acp7002_0001"]
 #manual_db_nums = [7999, 7997, 1112, 8000]
-#manual_db_nums = [7326]
+# manual_db_nums = [7355]
 plat_url = ""
 
 #puhua
