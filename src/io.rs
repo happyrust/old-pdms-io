@@ -214,8 +214,15 @@ impl PdmsIO {
         Err(anyhow!("Can't find the att pos loc"))
     }
 
+    /// 解析增量数据
+    pub async fn parse_incr_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
+        //判断这个参考号对应的数据是是增删改的哪一类、
+
+        Ok(EleData::default())
+    }
+
     ///获取单个element数据
-    pub async fn get_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
+    pub async fn parse_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
         let mut file = self.get_file()?;
         let mut data = vec![0u8; 0x800];
         file.seek(SeekFrom::Start(refno_offset))?;
@@ -237,7 +244,7 @@ impl PdmsIO {
     #[inline]
     pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
         let loc = self.search_refno_pgno(refno)?;
-        let mut ele_data = self.get_element(loc.get_att_offset()).await?;
+        let mut ele_data = self.parse_element(loc.get_att_offset()).await?;
         Ok(ele_data)
     }
 
@@ -528,7 +535,7 @@ impl PdmsIO {
                     break;
                 }
                 let is_last = i == loc_len - 1;
-                let Ok(ele_data) = self.get_element(offset).await else {
+                let Ok(ele_data) = self.parse_element(offset).await else {
                     continue;
                 };
                 let att = ele_data.att_map();
@@ -705,7 +712,7 @@ impl PdmsIO {
                         continue;
                     };
                     // ses_op_map.entry(add_sesno).or_default().pop();
-                    let Ok(ele_data) = self.get_element(offset).await else {
+                    let Ok(ele_data) = self.parse_element(offset).await else {
                         continue;
                     };
                     let att = ele_data.att_map();
@@ -1292,7 +1299,7 @@ impl PdmsIO {
         let mut eles = vec![];
         //根据这个RefnoDataLoc 读取到所有发生更新的 index 数据
         for loc in final_locs {
-            let ele = self.get_element(loc.get_att_offset()).await.unwrap();
+            let ele = self.parse_element(loc.get_att_offset()).await.unwrap();
             eles.push(ele);
         }
         eles
@@ -1363,7 +1370,7 @@ impl PdmsIO {
             let final_locs = self.collect_refno_locs(sesno);
             //从后往前查看，如果是已经有了数据，就不需要再往里面加了
             for loc in final_locs {
-                if let Ok(ele) = self.get_element(loc.get_att_offset()).await {
+                if let Ok(ele) = self.parse_element(loc.get_att_offset()).await {
                     eles_map.insert(ele.refno, ele);
                 }
             }
@@ -1411,7 +1418,7 @@ impl PdmsIO {
 
         let mut eles_map = HashMap::new();
         for (refno, offset) in refno_data_offsets_map {
-            match self.get_element(offset).await {
+            match self.parse_element(offset).await {
                 Ok(ele) => {
                     eles_map.insert(ele.refno, ele);
                 }
