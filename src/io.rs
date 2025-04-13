@@ -475,7 +475,9 @@ impl PdmsIO {
             cur_ses_pgno = cur_ses_page.last_ses_pageno as _;
         }
         if pe_ses_sqls.len() > 0 {
-            tx.send(SesSqlType::PeSesSql(pe_ses_sqls)).unwrap();
+            if let Err(e) = tx.send(SesSqlType::PeSesSql(pe_ses_sqls)) {
+                dbg!(&e);
+            }
         }
         //关闭 channel
         drop(tx);
