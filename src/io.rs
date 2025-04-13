@@ -336,7 +336,7 @@ impl PdmsIO {
         // 查找大于等于目标会话号的最小会话号
         if let Some(next_sesno) = self.sesno_pgno_map.keys().filter(|&&s| s >= sesno).min() {
             near_sesno = *next_sesno;
-        // 如果没有找到,则返回最大的会话号
+            // 如果没有找到,则返回最大的会话号
         } else if let Some(&last_sesno) = self.sesno_pgno_map.keys().max() {
             near_sesno = last_sesno;
         }
@@ -465,8 +465,9 @@ impl PdmsIO {
             }
             //按 chunks 保存数据
             if pe_ses_sqls.len() > 100 {
-                tx.send(SesSqlType::PeSesSql(std::mem::take(&mut pe_ses_sqls)))
-                    .unwrap();
+                if let Err(e) = tx.send(SesSqlType::PeSesSql(std::mem::take(&mut pe_ses_sqls))) {
+                    dbg!(&e);
+                }
             }
 
             if cur_ses_page.last_ses_pageno < 0 {
@@ -622,9 +623,9 @@ impl PdmsIO {
                 let pe_json = pe.gen_sur_json_with_sesno(sesno as _, owner_sesno as _);
                 all_his_pe_json.push(pe_json);
                 let Some(att_json) = att.gen_sur_json_with_sesno(sesno as _, &refno_sesno_map)
-                else {
-                    continue;
-                };
+                    else {
+                        continue;
+                    };
                 prev_att_json = Some(att_json.clone());
                 //保存his_relate 数据
                 let ses_refno = RefnoSesno::new(refno, sesno);
@@ -650,7 +651,7 @@ impl PdmsIO {
                     sesno,
                     dbnum,
                 )
-                .await?;
+                    .await?;
                 // dbg!(&owner_relates);
                 pe_owner_h_relates.extend(owner_relates);
 
@@ -726,9 +727,9 @@ impl PdmsIO {
                     all_his_pe_json.push(pe_json);
                     let Some(att_json) =
                         att.gen_sur_json_with_sesno(add_sesno as _, &refno_sesno_map)
-                    else {
-                        continue;
-                    };
+                        else {
+                            continue;
+                        };
                     all_his_att_json_map
                         .entry(att.get_type())
                         .or_default()
@@ -746,7 +747,7 @@ impl PdmsIO {
                         add_sesno,
                         dbnum,
                     )
-                    .await?;
+                        .await?;
                     pe_owner_h_relates.extend(owner_relates);
                 }
             }
@@ -814,7 +815,7 @@ impl PdmsIO {
                 refno_sesno.to_pe_key()
             };
             let mut sql = if refno_sesno.sesno().unwrap_or_default() == 0 {
-                format!("UPSERT {} set op={}", id, op.into_num(),)
+                format!("UPSERT {} set op={}", id, op.into_num(), )
             } else {
                 format!(
                     "UPSERT {} set op={}, sesno={}",
