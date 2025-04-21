@@ -15,23 +15,30 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto;
 use std::fmt::format;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+/// PDMS数据库IO操作结构体
 #[derive(Debug)]
 pub struct PdmsIO {
+    /// 项目名称
     pub project: String,
+    /// 数据库文件路径
     pub path: PathBuf,
+    /// 是否只读模式
     pub readonly: bool,
+    /// 数据库编号
     pub dbnum: i32,
+    /// 数据库文件句柄
     pub file: Option<File>,
-    //sesno
+    /// 会话页面数据映射表,key为会话编号(sesno)
     pub ses_data_map: HashMap<u32, SessionPageData>,
+    /// 会话编号到页号的映射表
     pub sesno_pgno_map: BTreeMap<i32, u32>,
-    //start pgno 和 end pgno
+    /// 会话页面范围映射表,记录每个会话的起始页号和结束页号
     pub ses_range_map: BTreeMap<i32, Range<u32>>,
 }
 
@@ -148,6 +155,161 @@ impl PdmsIO {
         Ok(latest_ses_data.get_dt())
     }
 
+    /// 给定一个参考号判定其状态是增加还是删除还是修改了
+    ///
+    /// # 参数
+    /// * `refno` - 需要判断状态的参考号
+    ///
+    /// # 返回值
+    /// * `Ok(EleOperation::Add)` - 参考号是新增的
+    /// * `Ok(EleOperation::Modified)` - 参考号是修改过的
+    /// * `Ok(EleOperation::Deleted)` - 参考号是已删除的
+    /// * `Err(_)` - 参考号不存在或发生其他错误
+    ///
+    /// # 示例
+    /// ```
+    /// # async fn example() -> anyhow::Result<()> {
+    /// # use pdms_io::io::PdmsIO;
+    /// # use aios_core::pdms_types::{RefU64, EleOperation};
+    /// let mut io = PdmsIO::new("ams", "path/to/db", true);
+    /// io.open()?;
+    /// let refno: RefU64 = "17496/171606".into();
+    /// let status = io.get_refno_status(refno).await?;
+    /// println!("参考号 {} 的状态是: {:?}", refno, status);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn get_refno_status(&mut self, refno: RefU64) -> anyhow::Result<EleOperation> {
+        // 判断refno是否存在于数据库中
+        match self.search_refno_pgno(refno) {
+            Ok(loc) => {
+                // 找到refno所在的页号
+                let pgno = loc.pgno;
+                // 获取对应的会话号
+                let sesno = self.get_sesno(pgno).unwrap_or_default();
+                
+                // 获取历史记录的位置信息
+                // 通过检查这个refno在不同会话中出现的次数和内容变化来判断其状态
+                let history_map = self.collect_refno_history(refno)?;
+                
+                // 如果只出现过一次，则是新增
+                if history_map.len() == 1 {
+                    return Ok(EleOperation::Add);
+                }
+                
+                // 获取当前元素数据
+                let current_ele_data = self.auto_get_element(refno).await?;
+                
+                // 获取历史记录中的上一个版本
+                let mut prev_session = 0;
+                let mut prev_offset = 0;
+                
+                // 找出当前会话之前的最新会话
+                for (&session, &offset) in &history_map {
+                    if session < sesno as i32 && session > prev_session {
+                        prev_session = session;
+                        prev_offset = offset;
+                    }
+                }
+                
+                // 如果没有找到上一个版本，则是新增
+                if prev_session == 0 {
+                    return Ok(EleOperation::Add);
+                }
+                
+                // 读取上一个版本的数据进行比较
+                let prev_ele_data = self.parse_element(prev_offset).await?;
+                
+                // 比较两个版本的数据，判断是新增、删除还是修改
+                // 比较子元素列表是否有变化
+                let current_children = &current_ele_data.children.0;
+                let prev_children = &prev_ele_data.children.0;
+                // 长度不同或内容不同，则判定为修改
+                if current_children.len() != prev_children.len() || 
+                   !current_children.iter().all(|item| prev_children.contains(item)) {
+                    return Ok(EleOperation::Modified);
+                }
+                
+                // 如果需要更详细的比较，可以比较属性值等
+                // 这里简化处理，认为还有其他属性变化
+                let current_att = current_ele_data.att_map();
+                let prev_att = prev_ele_data.att_map();
+                
+                // 比较两个版本的JSON表示，看是否有变化
+                // 简化判断逻辑，实际中需要更细致地比较
+                if format!("{:?}", current_att) != format!("{:?}", prev_att) {
+                    return Ok(EleOperation::Modified);
+                }
+                
+                // 如果没有发现任何变化，返回添加状态（一般不应该到这里）
+                Ok(EleOperation::Add)
+            }
+            Err(_) => {
+                // 如果找不到refno，可能是已被删除
+                // 需要进一步判断是否曾经存在过
+                // 首先检查所有历史会话，看这个refno是否在过去的会话中出现过
+                
+                // 获取所有会话
+                let all_sessions: Vec<i32> = self.sesno_pgno_map.keys().cloned().collect();
+                
+                // 遍历所有会话，检查这个refno是否在历史中存在过
+                for &sesno in &all_sessions {
+                    // 获取会话页号
+                    if let Some(ses_pgno) = self.get_ses_pageno(sesno) {
+                        // 收集这个会话中的所有refno
+                        let locs = self.collect_refno_locs_in_session(ses_pgno);
+                        
+                        // 检查是否包含目标refno
+                        for loc in locs {
+                            if RefU64::from_two_nums(loc.refno_0, loc.refno_1) == refno {
+                                // 如果在历史会话中找到了，但在当前最新状态找不到，说明是被删除了
+                                return Ok(EleOperation::Deleted);
+                            }
+                        }
+                    }
+                }
+                
+                // 如果历史中也找不到，那么真的不存在
+                Err(anyhow!("参考号 {} 不存在于数据库中", refno))
+            }
+        }
+    }
+    
+    // 收集指定参考号的历史记录
+    ///
+    /// 遍历所有会话，查找指定参考号在各个会话中的位置信息
+    ///
+    /// # 参数
+    /// * `refno` - 需要收集历史记录的参考号
+    ///
+    /// # 返回值
+    /// * `BTreeMap<i32, u64>` - 会话号与对应的参考号偏移量映射表
+    fn collect_refno_history(&mut self, refno: RefU64) -> anyhow::Result<BTreeMap<i32, u64>> {
+        let mut history_map = BTreeMap::new();
+        
+        // 获取所有会话
+        let all_sessions: Vec<i32> = self.sesno_pgno_map.keys().cloned().collect();
+        
+        // 遍历所有会话，查找refno的所有历史记录
+        for &sesno in &all_sessions {
+            // 获取会话页号
+            if let Some(ses_pgno) = self.get_ses_pageno(sesno) {
+                // 收集这个会话中的所有refno
+                let locs = self.collect_refno_locs_in_session(ses_pgno);
+                
+                // 检查是否包含目标refno
+                for loc in locs {
+                    if RefU64::from_two_nums(loc.refno_0, loc.refno_1) == refno {
+                        history_map.insert(sesno, loc.get_att_offset());
+                        break;
+                    }
+                }
+            }
+        }
+        
+        Ok(history_map)
+    }
+
     pub fn get_att_latest_pgno_old(&mut self) -> anyhow::Result<u32> {
         let mut file = self.get_file()?;
         let mut input = vec![];
@@ -173,6 +335,16 @@ impl PdmsIO {
         Ok(max_pgno)
     }
 
+    /// 在数据库中搜索指定参考号的物理存储位置
+    /// 
+    /// # 参数
+    /// * `refno` - 要搜索的参考号
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<RefnoDataLoc>` - 成功返回参考号的物理存储位置信息,失败返回错误
+    /// 
+    /// # 错误
+    /// 当找不到指定参考号时返回错误
     pub fn search_refno_pgno(&mut self, refno: RefU64) -> anyhow::Result<RefnoDataLoc> {
         let basic_info = self.get_page_basic_info()?;
         let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
@@ -1436,6 +1608,24 @@ impl PdmsIO {
         Ok(eles_map)
     }
 
+
+    /// 搜索参考号是否存在
+    /// 
+    /// # 参数
+    /// * `refno` - 要搜索的参考号
+    ///
+    /// # 返回值
+    /// * `Ok(bool)` - 如果找到返回 true,否则返回 false
+    /// 
+    /// # 错误
+    /// * 如果文件读取失败会返回错误
+    /// 
+    /// # 示例
+    /// ```no_run
+    /// use pdms_io::PdmsIO;
+    /// let mut io = PdmsIO::new("test.pdms");
+    /// let exists = io.search_refno(RefU64::new(1, 2))?;
+    /// ```
     pub fn search_refno(&mut self, refno: RefU64) -> anyhow::Result<bool> {
         let file = self.get_file()?;
         file.seek(SeekFrom::Start(0u64))?;
@@ -1543,6 +1733,937 @@ impl PdmsIO {
 
         Ok(true)
     }
+
+    /// 构建索引映射表，读取所有index page的数据，组建一个BTreeMap，快速搜索指定的refno
+    /// 
+    /// 构建一个全局的refno到RefnoDataLoc数组的映射表，方便快速查找数据位置及其历史记录。
+    /// 利用B-Tree索引的特性，直接定位和处理叶子节点数据。
+    /// 
+    /// # 参数
+    /// * `verbose` - 是否显示详细构建信息，默认为false
+    /// 
+    /// # 返回值
+    /// * `BTreeMap<RefU64, Vec<RefnoDataLoc>>` - 参考号到数据位置数组的映射表
+    /// 
+    /// # 错误
+    /// * 文件读取出错时返回错误
+    /// 
+    /// # 示例
+    /// ```no_run
+    /// use pdms_io::PdmsIO;
+    /// 
+    /// let mut io = PdmsIO::new("project", "path/to/db", true);
+    /// io.open()?;
+    /// let index_map = io.build_index_map(false)?; // 不显示详细信息
+    /// // 现在可以快速查找refno及其历史记录
+    /// let refno = RefU64::from("12345/678");
+    /// if let Some(locs) = index_map.get(&refno) {
+    ///     println!("Found refno with {} history records", locs.len());
+    ///     // 获取最新版本
+    ///     let latest = &locs[0];
+    ///     println!("Latest version at pgno: {}, offset: {}", latest.pgno, latest.offset);
+    /// }
+    /// ```
+    pub fn build_index_map_verbose(&mut self, verbose: bool) -> anyhow::Result<BTreeMap<RefU64, BTreeSet<u64>>> {
+        // 获取数据库基本信息
+        let page_info = self.get_page_basic_info()?;
+        // 获取最新的索引根页号
+        let latest_index_pgno = page_info.latest_ses_data.index_root_pageno;
+        println!("latest_index_pgno: {:#4X}", latest_index_pgno);
+        
+        // 创建refno映射表，用于保存所有refno到位置(绝对偏移)的映射
+        let mut refno_map: BTreeMap<RefU64, BTreeSet<u64>> = BTreeMap::new();
+        
+        // 估计项目数量，用于内存预分配
+        let estimated_size = std::cmp::min(100_000, latest_index_pgno as usize * 10);
+        
+        // 统计信息
+        let mut total_nodes = 0;
+        let mut total_leaf_nodes = 0;
+        let mut total_index_nodes = 0;
+        let mut total_entries = 0;
+        
+        // 使用广度优先遍历算法遍历索引树
+        let mut queue: VecDeque<(u32, u32)> = VecDeque::new();
+        // 添加根节点到队列
+        queue.push_back((latest_index_pgno, 0));
+        
+        // 跟踪已经访问过的节点
+        let mut visited_nodes = HashSet::new();
+        
+        // 记录起始时间，用于计算性能
+        let start_time = std::time::Instant::now();
+        
+        // 批量处理，提高性能
+        let mut batch_size = 0;
+        let mut level = 0;
+        
+        // 广度优先遍历索引树
+        while !queue.is_empty() {
+            // 每批次处理100个同级别节点
+            let mut batch = Vec::with_capacity(100);
+            while !queue.is_empty() && batch.len() < 100 {
+                if let Some((pgno, node_level)) = queue.pop_front() {
+                    if node_level > level {
+                        level = node_level;
+                        if verbose {
+                            println!("Processing level {} of index tree", level);
+                        }
+                    }
+                    batch.push(pgno);
+                }
+            }
+            
+            batch_size += batch.len();
+            
+            // 按批次并行处理节点
+            for &pgno in &batch {
+                // 跳过已经访问过的节点
+                if visited_nodes.contains(&pgno) {
+                    continue;
+                }
+                
+                // 标记为已访问
+                visited_nodes.insert(pgno);
+                
+                // 读取并解析索引页数据
+                let Ok(index_data) = self.read_index_data(pgno) else {
+                    println!("error pgno: {:#4X}", pgno);
+                    continue;
+                };
+                total_nodes += 1;
+                
+                // 根据页面类型和级别判断处理方式
+                if index_data.level == 0 {
+                    // 叶子节点 (level = 0)
+                    total_leaf_nodes += 1;
+                    Self::process_leaf_node(&index_data, &mut refno_map);
+                    total_entries += index_data.refno_locs.len();
+                } else {
+                    // 非叶子节点 (level > 0)
+                    total_index_nodes += 1;
+                    
+                    // 遍历子节点引用
+                    for loc in &index_data.refno_locs {
+                        if loc.pgno > 0 {
+                            if loc.pgno == 0x1564 {
+                                dbg!(&index_data.refno_locs);
+                            }
+                            queue.push_back((loc.pgno, level + 1));
+                        }
+                    }
+                }
+            }
+            
+            // 每处理1000个节点输出一次进度信息
+            if verbose && batch_size % 1000 < 100 {
+                println!(
+                    "Processed {} index nodes ({} leaf nodes, {} index nodes), found {} entries, elapsed: {:?}",
+                    total_nodes, total_leaf_nodes, total_index_nodes, total_entries, start_time.elapsed()
+                );
+            }
+        }
+        
+        // 输出最终统计信息
+        if verbose {
+            println!(
+                "Index build completed: {} nodes ({} leaf, {} index), {} unique refnos, {} total entries, elapsed: {:?}",
+                total_nodes, total_leaf_nodes, total_index_nodes, refno_map.len(), total_entries, start_time.elapsed()
+            );
+        }
+        
+        Ok(refno_map)
+    }
+
+    // 处理叶子节点，提取refno和对应的位置信息
+    fn process_leaf_node(index_data: &IndexPageData, refno_map: &mut BTreeMap<RefU64, BTreeSet<u64>>) {
+        // 遍历叶子节点中的所有位置记录
+        for loc in &index_data.refno_locs {
+            // 跳过无效的记录
+            if loc.refno_0 == 0 && loc.refno_1 == 0 {
+                continue;
+            }
+            
+            // 检查页号和偏移是否有效
+            if loc.pgno == 0 || loc.offset == 0 {
+                continue;
+            }
+            
+            // 创建refno对象
+            let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
+            
+            // 获取绝对偏移量
+            let offset = loc.get_att_offset();
+            
+            // 将绝对偏移添加到refno对应的集合中
+            refno_map.entry(refno).or_insert_with(BTreeSet::new).insert(offset);
+        }
+    }
+
+    // 兼容旧接口，保持向后兼容性
+    pub fn build_index_map_default(&mut self) -> anyhow::Result<BTreeMap<RefU64, BTreeSet<u64>>> {
+        self.build_index_map_verbose(false)
+    }
+
+    // 主要索引构建方法，默认不输出详细信息
+    pub fn build_index_map(&mut self) -> anyhow::Result<BTreeMap<RefU64, BTreeSet<u64>>> {
+        self.build_index_map_default()
+    }
+
+    /// 过滤掉数据一致的冗余历史记录
+    /// 
+    /// # 参数
+    /// * `refno_map` - 需要过滤的refno映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<()>` - 成功或错误
+    async fn filter_consistent_data(&mut self, refno_map: &mut BTreeMap<RefU64, BTreeSet<u64>>) -> anyhow::Result<()> {
+        // 创建一个临时映射表来存储过滤后的结果
+        let mut filtered_map = BTreeMap::new();
+        
+        // 计算过滤前的总记录数
+        let before_total: usize = refno_map.values().map(|v| v.len()).sum();
+        let mut unique_count = 0;
+        let mut duplicate_count = 0;
+        
+        // 遍历所有refno
+        for (refno, offsets) in refno_map.iter() {
+            if offsets.is_empty() {
+                continue;
+            }
+            
+            // 创建过滤后的位置集合
+            let mut filtered_offsets = BTreeSet::new();
+            
+            // 如果只有一个记录，直接保存并继续
+            if offsets.len() <= 1 {
+                filtered_map.insert(*refno, offsets.clone());
+                unique_count += offsets.len();
+                continue;
+            }
+            
+            // 获取最新版本数据作为比较基准（BTreeSet中的最后一个元素）
+            let latest_offset = *offsets.iter().next_back().unwrap();
+            filtered_offsets.insert(latest_offset);
+            unique_count += 1;
+            
+            let latest_data = match self.parse_element(latest_offset).await {
+                Ok(data) => data,
+                Err(e) => {
+                    eprintln!("解析refno {} 最新版本时出错: {}", refno, e);
+                    // 如果无法解析最新版本，保留所有位置记录
+                    filtered_map.insert(*refno, offsets.clone());
+                    unique_count += offsets.len() - 1;
+                    continue;
+                }
+            };
+            
+            // 存储已经处理过的数据内容哈希值，避免重复添加相同内容的记录
+            let mut processed_hashes = HashSet::new();
+            let latest_hash = Self::calculate_element_hash(&latest_data);
+            processed_hashes.insert(latest_hash);
+            
+            // 检查其余位置记录（除了最新的）
+            for &offset in offsets.iter().filter(|&&o| o != latest_offset) {
+                match self.parse_element(offset).await {
+                    Ok(curr_data) => {
+                        // 计算当前记录的哈希值
+                        let curr_hash = Self::calculate_element_hash(&curr_data);
+                        
+                        // 如果这个哈希值不在已处理集合中，说明是不同的数据
+                        if !processed_hashes.contains(&curr_hash) {
+                            // 添加到过滤后的记录中
+                            filtered_offsets.insert(offset);
+                            unique_count += 1;
+                            // 记录这个哈希值
+                            processed_hashes.insert(curr_hash);
+                        } else {
+                            // 这是重复的数据，计数
+                            duplicate_count += 1;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("解析refno {} 历史版本时出错: {}", refno, e);
+                        // 出错时保留这个位置记录，避免数据丢失
+                        filtered_offsets.insert(offset);
+                        unique_count += 1;
+                    }
+                }
+            }
+            
+            // 保存过滤后的位置集合
+            filtered_map.insert(*refno, filtered_offsets);
+        }
+        
+        // 计算过滤后的总记录数
+        let after_total: usize = filtered_map.values().map(|v| v.len()).sum();
+        
+        // 输出过滤效果
+        println!("数据过滤统计:");
+        println!("- 过滤前总记录数: {}", before_total);
+        println!("- 过滤后总记录数: {}", after_total);
+        println!("- 移除的重复记录: {}", duplicate_count);
+        println!("- 保留的唯一记录: {}", unique_count);
+        println!("- 过滤效率: {:.2}%", if before_total > 0 { (duplicate_count as f64 / before_total as f64) * 100.0 } else { 0.0 });
+        
+        // 用过滤后的映射表替换原映射表
+        *refno_map = filtered_map;
+        
+        Ok(())
+    }
+    
+    /// 计算元素数据的哈希值用于比较
+    fn calculate_element_hash(ele_data: &EleData) -> u64 {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        
+        return 0;
+        // let mut hasher = DefaultHasher::new();
+        
+        // // 哈希基本属性
+        // ele_data.name.hash(&mut hasher);
+        // ele_data.refno.hash(&mut hasher);
+        
+        // // 哈希子元素列表
+        // ele_data.children.hash(&mut hasher);
+        
+        // // 哈希属性映射
+        // let att_map = ele_data.att_map();
+        // let att_type = att_map.get_type();
+        // att_type.hash(&mut hasher);
+        
+        // // 哈希状态
+        // let status = att_map.get_status();
+        // status.hash(&mut hasher);
+        
+        // // 获取哈希值
+        // hasher.finish()
+    }
+    
+    /// 使用构建好的索引映射表快速查找refno对应的所有数据位置
+    /// 
+    /// # 参数
+    /// * `refno` - 要查找的参考号
+    /// * `index_map` - 参考号到数据位置数组的映射表
+    /// 
+    /// # 返回值
+    /// * `Option<&Vec<RefnoDataLoc>>` - 如果找到则返回数据位置数组，否则返回None
+    pub fn fast_lookup_refno<'a>(&self, refno: &RefU64, index_map: &'a BTreeMap<RefU64, BTreeSet<u64>>) -> Option<&'a BTreeSet<u64>> {
+        index_map.get(refno)
+    }
+    
+    /// 获取refno的最新位置
+    /// 
+    /// # 参数
+    /// * `refno` - 要查找的参考号
+    /// * `index_map` - 参考号到数据位置数组的映射表
+    /// 
+    /// # 返回值
+    /// * `Option<&RefnoDataLoc>` - 如果找到则返回最新的数据位置，否则返回None
+    pub fn fast_lookup_latest_loc<'a>(&self, refno: &RefU64, index_map: &'a BTreeMap<RefU64, BTreeSet<u64>>) -> Option<&'a u64> {
+        index_map.get(refno).and_then(|locs| locs.first())
+    }
+    
+    /// 使用索引映射表快速获取元素最新数据
+    /// 
+    /// # 参数
+    /// * `refno` - 要获取的元素的参考号
+    /// * `index_map` - 参考号到数据位置数组的映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<EleData>` - 元素数据或错误
+    pub async fn fast_get_element(&mut self, refno: RefU64, index_map: &BTreeMap<RefU64, BTreeSet<u64>>) -> anyhow::Result<EleData> {
+        if let Some(locs) = index_map.get(&refno) {
+            if let Some(latest_offset) = locs.iter().next_back() {
+                // 直接使用绝对偏移值解析元素
+                let offset = *latest_offset;
+                return self.parse_element(offset).await;
+            }
+        }
+        
+        Err(anyhow!("找不到refno: {:?}", refno))
+    }
+
+    /// 获取指定版本的元素数据
+    /// 
+    /// # 参数
+    /// * `refno` - 参考号
+    /// * `index_map` - 索引映射表
+    /// * `version_index` - 版本索引，0表示最新版本
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<EleData>` - 指定版本的元素数据
+    pub async fn fast_get_element_version(&mut self, refno: RefU64, index_map: &BTreeMap<RefU64, BTreeSet<u64>>, version_index: usize) -> anyhow::Result<EleData> {
+        if let Some(locs) = index_map.get(&refno) {
+            // 将BTreeSet转换为Vec以便随机访问
+            let offsets: Vec<&u64> = locs.iter().collect();
+            
+            // 计算实际索引 (倒序，因为BTreeSet是有序的且我们通常想要最新的版本)
+            let actual_index = if version_index < offsets.len() {
+                offsets.len() - 1 - version_index
+            } else {
+                return Err(anyhow!("版本索引越界: {} (总版本数: {})", version_index, offsets.len()));
+            };
+            
+            if let Some(offset) = offsets.get(actual_index) {
+                return self.parse_element(**offset).await;
+            }
+        }
+        
+        Err(anyhow!("找不到refno: {:?}", refno))
+    }
+
+    /// 获取元素的所有历史版本
+    /// 
+    /// # 参数
+    /// * `refno` - 参考号
+    /// * `index_map` - 索引映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<Vec<EleData>>` - 所有历史版本的元素数据
+    pub async fn fast_get_element_history(&mut self, refno: RefU64, index_map: &BTreeMap<RefU64, BTreeSet<u64>>) -> anyhow::Result<Vec<EleData>> {
+        if let Some(locs) = index_map.get(&refno) {
+            let mut history = Vec::with_capacity(locs.len());
+            
+            // 倒序处理，从旧到新
+            for offset in locs.iter() {
+                match self.parse_element(*offset).await {
+                    Ok(data) => history.push(data),
+                    Err(e) => {
+                        eprintln!("解析refno {:?} 在偏移 {} 的元素时出错: {}", refno, offset, e);
+                    }
+                }
+            }
+            
+            return Ok(history);
+        }
+        
+        Err(anyhow!("找不到refno: {:?}", refno))
+    }
+
+    /// 批量获取元素数据
+    /// 
+    /// # 参数
+    /// * `refnos` - 参考号数组
+    /// * `index_map` - 索引映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<Vec<(RefU64, EleData)>>` - 元素数据列表
+    pub async fn fast_get_elements(&mut self, refnos: &[RefU64], index_map: &BTreeMap<RefU64, BTreeSet<u64>>) -> anyhow::Result<Vec<(RefU64, EleData)>> {
+        let mut results = Vec::new();
+        
+        for &refno in refnos {
+            if let Some(locs) = index_map.get(&refno) {
+                if let Some(latest_offset) = locs.iter().next_back() {
+                    match self.parse_element(*latest_offset).await {
+                        Ok(data) => {
+                            results.push((refno, data));
+                        }
+                        Err(e) => {
+                            eprintln!("解析refno {:?} 在偏移 {} 的元素时出错: {}", refno, latest_offset, e);
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
+    /// 使用索引映射表优化的增量元素收集
+    /// 
+    /// 相比于原始的collect_increment_eles，此方法利用索引映射表加速查询过程
+    /// 
+    /// # 参数
+    /// * `sesno_range` - 会话号范围（包含边界）
+    /// * `index_map` - 预先构建好的索引映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<HashMap<RefU64, EleData>>` - 元素参考号到元素数据的映射表
+    pub async fn collect_increment_eles_optimized(
+        &mut self,
+        sesno_range: RangeInclusive<i32>,
+        index_map: &BTreeMap<RefU64, BTreeSet<u64>>,
+    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
+        let mut eles_map = HashMap::new();
+        
+        // 获取范围内的所有会话号
+        let mut sesnos: Vec<i32> = self.sesno_pgno_map
+            .keys()
+            .filter(|&sesno| sesno_range.contains(sesno))
+            .cloned()
+            .collect();
+        
+        // 按会话号排序，确保按时间顺序处理
+        sesnos.sort_unstable();
+        
+        println!("处理范围内的会话: {:?}", sesnos);
+        
+        // 遍历每个会话，收集增量数据
+        for &sesno in &sesnos {
+            if let Some(ses_pgno) = self.get_ses_pageno(sesno) {
+                // 收集当前会话中的所有引用号位置
+                let locs = self.collect_refno_locs_in_session(ses_pgno);
+                
+                println!("会话 {} 包含 {} 个元素引用", sesno, locs.len());
+                
+                // 处理每个位置
+                for loc in locs {
+                    let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
+                    let offset = loc.get_att_offset();
+                    
+                    // 使用索引映射表快速检查这个refno是否是最新版本
+                    if let Some(offsets) = index_map.get(&refno) {
+                        // 获取最新的偏移量
+                        if let Some(&latest_offset) = offsets.iter().next_back() {
+                            // 如果当前位置是最新的，则解析并添加到结果中
+                            if offset == latest_offset {
+                                match self.parse_element(offset).await {
+                                    Ok(data) => {
+                                        eles_map.insert(refno, data);
+                                    }
+                                    Err(e) => {
+                                        eprintln!("解析元素 {:?} 时出错: {}", refno, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        println!("增量收集完成，共 {} 个元素", eles_map.len());
+        Ok(eles_map)
+    }
+    
+    /// 缓存索引映射表，避免重复构建
+    /// 
+    /// 将索引映射表缓存为文件，以便下次快速加载
+    /// 
+    /// # 参数
+    /// * `cache_path` - 缓存文件路径
+    /// * `index_map` - 索引映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<()>` - 成功或错误
+    pub fn cache_index_map(&self, cache_path: &Path, index_map: &BTreeMap<RefU64, BTreeSet<u64>>) -> anyhow::Result<()> {
+        let file = File::create(cache_path)?;
+        let mut writer = io::BufWriter::new(file);
+        
+        // 写入总项数
+        let count = index_map.len() as u32;
+        writer.write_all(&count.to_le_bytes())?;
+        
+        // 写入每个参考号及其对应的偏移量集合
+        for (refno, offsets) in index_map {
+            // 写入refno的两个组成部分
+            let refno_0 = refno.get_0();
+            let refno_1 = refno.get_1();
+            writer.write_all(&refno_0.to_le_bytes())?;
+            writer.write_all(&refno_1.to_le_bytes())?;
+            
+            // 写入偏移量数量
+            let loc_count = offsets.len() as u32;
+            writer.write_all(&loc_count.to_le_bytes())?;
+            
+            // 写入所有偏移量
+            for &offset in offsets {
+                writer.write_all(&offset.to_le_bytes())?;
+            }
+        }
+        
+        writer.flush()?;
+        Ok(())
+    }
+    
+    /// 从缓存文件加载索引映射表
+    /// 
+    /// # 参数
+    /// * `cache_path` - 缓存文件路径
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<BTreeMap<RefU64, Vec<RefnoDataLoc>>>` - 加载的索引映射表或错误
+    pub fn load_cached_index_map(&self, cache_path: &Path) -> anyhow::Result<BTreeMap<RefU64, BTreeSet<u64>>> {
+        let file = File::open(cache_path)?;
+        let mut reader = io::BufReader::new(file);
+        
+        // 读取总项数
+        let mut count_bytes = [0u8; 4];
+        reader.read_exact(&mut count_bytes)?;
+        let count = u32::from_le_bytes(count_bytes);
+        
+        // 创建结果映射表
+        let mut index_map = BTreeMap::new();
+        
+        // 读取每个refno及其对应的位置信息
+        for _ in 0..count {
+            // 读取refno的两个组成部分
+            let mut refno_0_bytes = [0u8; 4];
+            let mut refno_1_bytes = [0u8; 4];
+            reader.read_exact(&mut refno_0_bytes)?;
+            reader.read_exact(&mut refno_1_bytes)?;
+            
+            let refno_0 = u32::from_le_bytes(refno_0_bytes);
+            let refno_1 = u32::from_le_bytes(refno_1_bytes);
+            let refno = RefU64::from_two_nums(refno_0, refno_1);
+            
+            // 读取此refno对应的偏移量数量
+            let mut loc_count_bytes = [0u8; 4];
+            reader.read_exact(&mut loc_count_bytes)?;
+            let loc_count = u32::from_le_bytes(loc_count_bytes);
+            
+            // 读取所有偏移量
+            let mut offsets = BTreeSet::new();
+            for _ in 0..loc_count {
+                let mut offset_bytes = [0u8; 8];
+                reader.read_exact(&mut offset_bytes)?;
+                let offset = u64::from_le_bytes(offset_bytes);
+                offsets.insert(offset);
+            }
+            
+            // 添加到映射表
+            index_map.insert(refno, offsets);
+        }
+        
+        Ok(index_map)
+    }
+
+    /// 使用索引映射表优化的参考号状态检查方法
+    ///
+    /// 相比于原始的get_refno_status方法，此方法利用索引映射表加速状态判断过程
+    ///
+    /// # 参数
+    /// * `refno` - 需要判断状态的参考号
+    /// * `index_map` - 预先构建的索引映射表
+    ///
+    /// # 返回值
+    /// * `Ok(EleOperation::Add)` - 参考号是新增的
+    /// * `Ok(EleOperation::Modified)` - 参考号是修改过的
+    /// * `Ok(EleOperation::Deleted)` - 参考号是已删除的
+    /// * `Err(_)` - 参考号不存在或发生其他错误
+    pub async fn fast_get_refno_status(
+        &mut self, 
+        refno: RefU64,
+        index_map: &BTreeMap<RefU64, BTreeSet<u64>>
+    ) -> anyhow::Result<EleOperation> {
+        // 检查参考号是否存在于索引映射表中
+        if let Some(offsets) = index_map.get(&refno) {
+            if offsets.is_empty() {
+                return Ok(EleOperation::None);
+            }
+            
+            // 获取最新的偏移量
+            let latest_offset = *offsets.iter().next_back().unwrap();
+            
+            // 解析最新的元素数据
+            let latest_data = self.parse_element(latest_offset).await?;
+            
+            // 如果只有一个版本，则为新建操作
+            if offsets.len() == 1 {
+                return Ok(EleOperation::Add);
+            }else{
+                return Ok(EleOperation::Modified);
+                // let second_latest_offset = *offsets.iter().nth(offsets.len() - 2).unwrap();
+                // let previous_data = self.parse_element(second_latest_offset).await?;
+                
+                // // 比较元素的状态字段判断操作类型
+                // let latest_status = latest_data.att_map().get_status();
+                // let previous_status = previous_data.att_map().get_status();
+            };
+            
+            // 获取倒数第二新的偏移量
+            // let second_latest_offset = *offsets.iter().nth(offsets.len() - 2).unwrap();
+            // let previous_data = self.parse_element(second_latest_offset).await?;
+            
+            // 比较元素的状态字段判断操作类型
+            // let latest_status = latest_data.att_map().get_status();
+            // let previous_status = previous_data.att_map().get_status();
+            
+            // if latest_status == previous_status {
+            //     // 状态相同，可能是普通修改
+            //     Ok(EleOperation::Modified)
+            // } else if latest_status == 0 && previous_status != 0 {
+            //     // 从活动到非活动，表示删除
+            //     Ok(EleOperation::Deleted)
+            // } else if latest_status != 0 && previous_status == 0 {
+            //     // 从非活动到活动，表示恢复
+            //     Ok(EleOperation::Modified)
+            // } else {
+            //     // 其他状态变化
+            //     Ok(EleOperation::Modified)
+            // }
+        } else {
+            // 索引中不存在该参考号
+            Err(anyhow!("索引映射表中找不到参考号 {:?}", refno))
+        }
+    }
+
+    /// 批量获取多个元素及其子元素数据，使用索引映射表提高效率
+    /// 
+    /// # 参数
+    /// * `root_refno` - 根元素的参考号
+    /// * `index_map` - 参考号到数据位置数组的映射表
+    /// * `max_depth` - 最大递归深度，为0表示不限制深度
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<HashMap<RefU64, EleData>>` - 元素参考号到元素数据的映射表
+    pub async fn fast_get_elements_deep(
+        &mut self,
+        root_refno: RefU64,
+        index_map: &BTreeMap<RefU64, BTreeSet<u64>>,
+        max_depth: usize,
+    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
+        let mut results = HashMap::new();
+        let mut queue = VecDeque::new();
+        let mut visited = HashSet::new();
+        
+        // 首先获取根元素
+        if let Some(locs) = index_map.get(&root_refno) {
+            if let Some(latest_offset) = locs.iter().next_back() {
+                let offset = *latest_offset;
+                if let Ok(root_data) = self.parse_element(offset).await {
+                    visited.insert(root_refno);
+                    results.insert(root_refno, root_data.clone());
+                    
+                    // 将子元素添加到队列
+                    // if let Some(children) = &root_data.children {
+                    for &child_refno in root_data.children.iter() {
+                            if !visited.contains(&child_refno) {
+                                queue.push_back((child_refno, 1)); // 1表示深度为1
+                            }
+                        }
+                    // }
+                } else {
+                    return Err(anyhow!("无法解析根元素 {:?}", root_refno));
+                }
+            } else {
+                return Err(anyhow!("根元素 {:?} 无位置记录", root_refno));
+            }
+        } else {
+            return Err(anyhow!("索引映射表中找不到根元素 {:?}", root_refno));
+        }
+        
+        // 广度优先遍历处理子元素
+        while let Some((refno, depth)) = queue.pop_front() {
+            // 检查深度限制
+            if depth > max_depth {
+                continue;
+            }
+            
+            // 避免重复处理
+            if visited.contains(&refno) {
+                continue;
+            }
+            
+            visited.insert(refno);
+            
+            // 获取当前元素数据
+            if let Some(locs) = index_map.get(&refno) {
+                if let Some(latest_offset) = locs.iter().next_back() {
+                    let offset = *latest_offset;
+                    if let Ok(ele_data) = self.parse_element(offset).await {
+                        results.insert(refno, ele_data.clone());
+                        
+                        // 将子元素添加到队列
+                        // if let Some(children) = &ele_data.children {
+                        for &child_refno in ele_data.children.iter() {
+                            if !visited.contains(&child_refno) {
+                                queue.push_back((child_refno, depth + 1));
+                            }
+                        }
+                        // }
+                    }
+                }
+            }
+        }
+        
+        Ok(results)
+    }
+
+    /// 获取元素及其完整历史记录
+    /// 
+    /// 此函数返回元素的最新状态以及其所有历史版本，同时分析历史记录判断各版本间的变更类型
+    /// 
+    /// # 参数
+    /// * `refno` - 要查询的参考号
+    /// * `index_map` - 索引映射表
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<(EleData, Vec<(EleData, EleOperation)>)>` - 元素当前数据及历史记录（带操作类型）
+    pub async fn get_element_with_history(
+        &mut self,
+        refno: RefU64,
+        index_map: &BTreeMap<RefU64, BTreeSet<u64>>
+    ) -> anyhow::Result<(EleData, Vec<(EleData, EleOperation)>)> {
+        if let Some(offsets) = index_map.get(&refno) {
+            if offsets.is_empty() {
+                return Err(anyhow!("参考号 {} 在索引中存在但没有位置记录", refno));
+            }
+            
+            // 获取所有历史版本的数据
+            let mut history_elements = Vec::with_capacity(offsets.len());
+            for &offset in offsets {
+                match self.parse_element(offset).await {
+                    Ok(ele_data) => history_elements.push(ele_data),
+                    Err(e) => return Err(anyhow!("解析元素 {} 历史版本时出错: {}", refno, e)),
+                }
+            }
+            
+            // 确保有数据
+            if history_elements.is_empty() {
+                return Err(anyhow!("参考号 {} 没有历史数据", refno));
+            }
+            
+            // 最新版本（第一个元素）
+            let latest_element = history_elements[0].clone();
+            
+            // 历史版本及其操作类型
+            let mut history_with_ops = Vec::with_capacity(history_elements.len() - 1);
+            
+            // 处理历史记录（从最老到最新，不包括最新版本）
+            for i in (1..history_elements.len()).rev() {
+                let current = &history_elements[i];
+                let operation = if i == history_elements.len() - 1 {
+                    // 最老的版本，标记为新增
+                    EleOperation::Add
+                } else {
+                    // 比较与上一个版本（在历史中的下一个更老的版本）的差异
+                    let previous = &history_elements[i + 1];
+                    Self::determine_operation(current, previous)
+                };
+                
+                history_with_ops.push((current.clone(), operation));
+            }
+            
+            // 反转历史记录，使其按时间先后顺序排列（从旧到新）
+            history_with_ops.reverse();
+            
+            Ok((latest_element, history_with_ops))
+        } else {
+            Err(anyhow!("参考号 {} 在索引映射表中不存在", refno))
+        }
+    }
+    
+    /// 根据两个版本的元素数据判断操作类型
+    fn determine_operation(current: &EleData, previous: &EleData) -> EleOperation {
+        // 比较状态
+        // let current_status = current.att_map().get_status();
+        // let previous_status = previous.att_map().get_status();
+        
+        // // 如果状态从非0变为0，则认为是删除操作
+        // if current_status == 0 && previous_status != 0 {
+        //     return EleOperation::Deleted;
+        // }
+        
+        // // 如果两个版本完全相同，则可能是重复记录
+        // if current.att_map().get_type() == previous.att_map().get_type() &&
+        //    current.name == previous.name &&
+        //    current.children == previous.children {
+        //     return EleOperation::Duplicate;
+        // }
+        
+        // 默认为修改操作
+        EleOperation::Modified
+    }
+
+    /// 在数据库中搜索指定参考号的物理存储位置（优化版本，使用二分查找）
+    /// 
+    /// # 参数
+    /// * `refno` - 要搜索的参考号
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<RefnoDataLoc>` - 成功返回参考号的物理存储位置信息,失败返回错误
+    /// 
+    /// # 错误
+    /// 当找不到指定参考号时返回错误
+    pub fn search_refno_pgno_optimized(&mut self, refno: RefU64) -> anyhow::Result<RefnoDataLoc> {
+        let basic_info = self.get_page_basic_info()?;
+        let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
+        let mut index_data = self.read_index_data(latest_index_pgno)?;
+        let mut level = index_data.level as i32;
+        let (r0, r1) = (refno.get_0(), refno.get_1());
+        
+        while level >= 0 {
+            if level == 0 {
+                // 叶子节点时使用二分查找
+                match self.binary_search_refno(&index_data.refno_locs, r0 as u64, r1 as u64) {
+                    Some(idx) => return Ok(index_data.refno_locs[idx].clone()),
+                    None => break
+                }
+            } else {
+                // 非叶子节点时查找下一个页面
+                let next_pgno = match self.find_next_pgno_binary(&index_data.refno_locs, r0 as u64, r1 as u64) {
+                    Some(pgno) => pgno,
+                    None => return Err(anyhow!("无法在索引中找到下一个页面"))
+                };
+                
+                index_data = self.read_index_data(next_pgno)?;
+                level = index_data.level as i32;
+            }
+        }
+        
+        Err(anyhow!("未找到参考号: {:?}", refno))
+    }
+    
+    /// 使用二分查找在索引中查找参考号
+    fn binary_search_refno(&self, locs: &[RefnoDataLoc], r0: u64, r1: u64) -> Option<usize> {
+        let mut left = 0;
+        let mut right = locs.len();
+        
+        while left < right {
+            let mid = left + (right - left) / 2;
+            let loc = &locs[mid];
+            
+            if loc.refno_0 as u64 == r0 && loc.refno_1 as u64 == r1 {
+                return Some(mid);
+            }
+            
+            if loc.refno_0 as u64 > r0 || (loc.refno_0 as u64 == r0 && loc.refno_1 as u64 > r1) {
+                right = mid;
+            } else {
+                left = mid + 1;
+            }
+        }
+        
+        None
+    }
+    
+    /// 使用二分查找在非叶子节点中找到下一个页面
+    fn find_next_pgno_binary(&self, locs: &[RefnoDataLoc], r0: u64, r1: u64) -> Option<u32> {
+        if locs.is_empty() {
+            return None;
+        }
+        
+        // 如果参考号小于第一个元素，使用第一个页面
+        if r0 < locs[0].refno_0 as u64 || (r0 == locs[0].refno_0 as u64 && r1 < locs[0].refno_1 as u64) {
+            return Some(locs[0].pgno);
+        }
+        
+        // 如果参考号大于最后一个元素，使用最后一个页面
+        let last = locs.len() - 1;
+        if r0 > locs[last].refno_0 as u64 || (r0 == locs[last].refno_0 as u64 && r1 >= locs[last].refno_1 as u64) {
+            return Some(locs[last].pgno);
+        }
+        
+        // 二分查找合适的范围
+        let mut left = 0;
+        let mut right = locs.len() - 1;
+        
+        while left + 1 < right {
+            let mid = left + (right - left) / 2;
+            let loc = &locs[mid];
+            
+            if loc.refno_0 as u64 > r0 || (loc.refno_0 as u64 == r0 && loc.refno_1 as u64 > r1) {
+                right = mid;
+            } else {
+                left = mid;
+            }
+        }
+        
+        // 根据窗口查找的逻辑，返回左侧索引对应的页面
+        Some(locs[left].pgno)
+    }
 }
 
 pub async fn sync_all_history_data(path: &str) -> anyhow::Result<()> {
@@ -1550,4 +2671,334 @@ pub async fn sync_all_history_data(path: &str) -> anyhow::Result<()> {
     let mut io = PdmsIO::new("ams", path, true);
     io.sync_history().await.unwrap();
     Ok(())
+}
+
+/// 示例：使用索引映射表快速查询PDMS数据库
+///
+/// 这个函数演示了如何使用索引映射表来提高PDMS数据库的查询效率
+/// 
+/// # 参数
+/// * `path` - 数据库文件路径
+/// * `refnos` - 要查询的参考号列表
+/// 
+/// # 返回值
+/// * `anyhow::Result<()>` - 成功或错误
+pub async fn demo_fast_query_with_index_map(path: &str, refnos: &[RefU64]) -> anyhow::Result<()> {
+    // 创建并打开数据库
+    println!("初始化数据库连接...");
+    let mut io = PdmsIO::new("demo", path, true);
+    io.open()?;
+    
+    // 构建索引映射表
+    println!("构建索引映射表...");
+    let start_time = std::time::Instant::now();
+    let index_map = io.build_index_map_verbose(true)?;
+    let build_time = start_time.elapsed();
+    println!("索引构建完成，耗时: {:?}, 索引项数: {}", build_time, index_map.len());
+    
+    // 统计历史记录总数
+    let total_history_records: usize = index_map.values().map(|v| v.len()).sum();
+    println!("总历史记录数: {}", total_history_records);
+    
+    // 打印一些有历史记录的示例
+    let mut history_examples = index_map.iter()
+        .filter(|(_, offsets)| offsets.len() > 1)
+        .take(5)
+        .collect::<Vec<_>>();
+    
+    if !history_examples.is_empty() {
+        println!("\n具有历史记录的参考号示例:");
+        for (i, (refno, offsets)) in history_examples.iter().enumerate() {
+            println!("  {}. 参考号: {}, 历史版本数: {}", i+1, refno, offsets.len());
+            for (j, &offset) in offsets.iter().enumerate().take(3) {
+                println!("     - 版本 {}: 偏移量: {}", j, offset);
+            }
+            if offsets.len() > 3 {
+                println!("     - ... 还有 {} 个版本", offsets.len() - 3);
+            }
+        }
+    }
+    
+    // 尝试缓存索引（可选）
+    let cache_path = Path::new("index_map_cache.bin");
+    if !cache_path.exists() {
+        println!("缓存索引映射表...");
+        io.cache_index_map(cache_path, &index_map)?;
+        println!("索引已缓存到文件: {:?}", cache_path);
+    }
+    
+    // 使用索引查询数据
+    if !refnos.is_empty() {
+        println!("使用索引查询 {} 个参考号...", refnos.len());
+        let query_start = std::time::Instant::now();
+        let elements = io.fast_get_elements(refnos, &index_map).await?;
+        let query_time = query_start.elapsed();
+        
+        // 输出结果
+        println!("查询完成，耗时: {:?}, 找到 {} 个元素", query_time, elements.len());
+        for (refno, ele) in elements {
+            println!("参考号: {}, 名称: {}, 子元素数: {}", 
+                    refno, ele.name, ele.children.len());
+                
+            // 如果有历史版本，获取并打印历史信息
+            if let Some(offsets) = index_map.get(&refno) {
+                if offsets.len() > 1 {
+                    println!("  -> 该参考号有 {} 个历史版本", offsets.len());
+                    
+                    // 获取并比较第一个历史版本
+                    if offsets.len() >= 2 {
+                        if let Ok(history_ele) = io.fast_get_element_version(refno, &index_map, 1).await {
+                            println!("  -> 上一版本名称: {}, 子元素数: {}", 
+                                    history_ele.name, history_ele.children.len());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    // 测试深度查询（以第一个参考号为根）
+    if !refnos.is_empty() {
+        let root_refno = refnos[0];
+        println!("执行深度查询，根参考号: {}...", root_refno);
+        let deep_start = std::time::Instant::now();
+        let deep_elements = io.fast_get_elements_deep(root_refno, &index_map, 3).await?;
+        let deep_time = deep_start.elapsed();
+        
+        println!("深度查询完成，耗时: {:?}, 找到 {} 个元素", deep_time, deep_elements.len());
+    }
+    
+    Ok(())
+}
+
+/// 演示如何查询和分析元素的历史记录
+/// 
+/// 此函数展示了如何使用索引映射表获取元素的所有历史版本，并分析版本之间的变更
+/// 
+/// # 参数
+/// * `path` - 数据库文件路径
+/// * `refno` - 要查询历史的参考号
+/// 
+/// # 返回值
+/// * `anyhow::Result<()>` - 成功或错误
+pub async fn demo_history_query(path: &str, refno: RefU64) -> anyhow::Result<()> {
+    // println!("初始化数据库连接...");
+    // let mut io = PdmsIO::new("demo_history", path, true);
+    // io.open()?;
+    
+    // println!("构建索引映射表...");
+    // let start_time = std::time::Instant::now();
+    // let index_map = io.build_index_map_verbose(true).await?;
+    // let build_time = start_time.elapsed();
+    // println!("索引构建完成，耗时: {:?}, 索引项数: {}", build_time, index_map.len());
+    
+    // // 获取并打印指定参考号的历史信息
+    // println!("\n查询参考号 {} 的历史记录...", refno);
+    
+    // if let Some(offsets) = index_map.get(&refno) {
+    //     println!("找到 {} 个历史版本", offsets.len());
+        
+    //     // 获取所有历史版本的数据
+    //     let history_data = io.fast_get_element_history(refno, &index_map).await?;
+        
+    //     // 显示每个版本的详细信息
+    //     for (i, data) in history_data.iter().enumerate() {
+    //         println!("\n版本 {}:", i);
+    //         println!("  名称: {}", data.name);
+    //         println!("  类型: {}", data.element_type);
+    //         println!("  状态: {}", data.status);
+    //         println!("  创建时间: {:?}", data.cdate);
+    //         println!("  修改时间: {:?}", data.mdate);
+            
+    //         // 如果有子元素，显示子元素信息
+    //         if let Some(ref children) = data.children {
+    //             println!("  子元素数量: {}", children.len());
+    //             for (j, &child) in children.iter().enumerate().take(5) {
+    //                 println!("    子元素 {}: {:?}", j + 1, child);
+    //             }
+    //             if children.len() > 5 {
+    //                 println!("    ... 及其他 {} 个子元素", children.len() - 5);
+    //             }
+    //         }
+            
+    //         // 显示属性信息
+    //         if !data.attrs.is_empty() {
+    //             println!("  属性数量: {}", data.attrs.len());
+    //             for (j, (key, value)) in data.attrs.iter().enumerate().take(5) {
+    //                 println!("    属性 {}: {} = {:?}", j + 1, key, value);
+    //             }
+    //             if data.attrs.len() > 5 {
+    //                 println!("    ... 及其他 {} 个属性", data.attrs.len() - 5);
+    //             }
+    //         }
+    //     }
+        
+    //     // 分析版本变化
+    //     if history_data.len() >= 2 {
+    //         println!("\n版本变化分析:");
+    //         for i in 1..history_data.len() {
+    //             let current = &history_data[i];
+    //             let previous = &history_data[i-1];
+                
+    //             println!("从版本 {} 到版本 {}:", i-1, i);
+                
+    //             // 比较名称变化
+    //             if current.name != previous.name {
+    //                 println!("  名称从 \"{}\" 变更为 \"{}\"", previous.name, current.name);
+    //             }
+                
+    //             // 比较状态变化
+    //             if current.status != previous.status {
+    //                 println!("  状态从 {} 变更为 {}", previous.status, current.status);
+    //             }
+                
+    //             // 比较子元素数量变化
+    //             let prev_children_count = previous.children.as_ref().map_or(0, |c| c.len());
+    //             let curr_children_count = current.children.as_ref().map_or(0, |c| c.len());
+                
+    //             if prev_children_count != curr_children_count {
+    //                 println!("  子元素数量从 {} 变更为 {}", prev_children_count, curr_children_count);
+    //             }
+                
+    //             // 比较属性变化
+    //             if previous.attrs.len() != current.attrs.len() {
+    //                 println!("  属性数量从 {} 变更为 {}", previous.attrs.len(), current.attrs.len());
+    //             }
+    //         }
+    //     }
+    // } else {
+    //     println!("参考号 {} 在索引映射表中不存在", refno);
+    // }
+    
+    Ok(())
+}
+
+/// 对比原始search_refno_pgno和优化版本search_refno_pgno_optimized的性能
+pub async fn benchmark_search_refno_pgno(path: &str, refnos: &[RefU64], iterations: usize) -> anyhow::Result<()> {
+    let mut io = PdmsIO::new("bench", path, true);
+    io.open()?;
+    io.init_ses_range_map()?;
+
+    println!("开始性能对比测试，测试参考号数量: {}, 每个参考号重复次数: {}", refnos.len(), iterations);
+    println!("----------------------------------------------");
+
+    // 预热
+    for refno in refnos.iter() {
+        let _ = io.search_refno_pgno(*refno);
+        let _ = io.search_refno_pgno_optimized(*refno);
+    }
+
+    // 测试原始版本
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        for refno in refnos.iter() {
+            let _ = io.search_refno_pgno(*refno);
+        }
+    }
+    let original_duration = start.elapsed();
+    println!("原始版本总耗时: {:?}", original_duration);
+    println!("原始版本平均每次查询耗时: {:?}", original_duration / (refnos.len() as u32 * iterations as u32));
+
+    // 测试优化版本
+    let start = std::time::Instant::now();
+    for _ in 0..iterations {
+        for refno in refnos.iter() {
+            let _ = io.search_refno_pgno_optimized(*refno);
+        }
+    }
+    let optimized_duration = start.elapsed();
+    println!("优化版本总耗时: {:?}", optimized_duration);
+    println!("优化版本平均每次查询耗时: {:?}", optimized_duration / (refnos.len() as u32 * iterations as u32));
+
+    // 计算性能提升百分比
+    let improvement = (original_duration.as_secs_f64() - optimized_duration.as_secs_f64()) / original_duration.as_secs_f64() * 100.0;
+    println!("性能提升: {:.2}%", improvement);
+    println!("----------------------------------------------");
+
+    // 验证两个函数的结果一致性
+    println!("验证查询结果一致性...");
+    let mut consistent = true;
+    for refno in refnos.iter() {
+        let result1 = io.search_refno_pgno(*refno);
+        let result2 = io.search_refno_pgno_optimized(*refno);
+        
+        match (result1, result2) {
+            (Ok(loc1), Ok(loc2)) => {
+                if loc1.pgno != loc2.pgno || loc1.offset != loc2.offset {
+                    println!("参考号 {:?} 查询结果不一致!", refno);
+                    println!("原始版本: 页号={}, 偏移={}", loc1.pgno, loc1.offset);
+                    println!("优化版本: 页号={}, 偏移={}", loc2.pgno, loc2.offset);
+                    consistent = false;
+                }
+            },
+            (Err(_), Err(_)) => {
+                // 两个版本都没找到，视为一致
+            },
+            _ => {
+                println!("参考号 {:?} 查询结果不一致: 一个版本找到了，另一个没找到", refno);
+                consistent = false;
+            }
+        }
+    }
+    
+    if consistent {
+        println!("所有测试参考号的查询结果一致!");
+    } else {
+        println!("警告: 发现查询结果不一致，请检查实现!");
+    }
+
+    Ok(())
+}
+
+/// 从数据库中提取一些真实的参考号用于测试
+/// 
+/// # 参数
+/// * `io` - PDMS IO实例
+/// * `count` - 需要提取的参考号数量
+/// 
+/// # 返回值
+/// * `Vec<RefU64>` - 提取到的参考号集合
+pub fn extract_test_refnos(io: &mut PdmsIO, count: usize) -> anyhow::Result<Vec<RefU64>> {
+    let basic_info = io.get_page_basic_info()?;
+    let latest_index_pgno = basic_info.latest_ses_data.index_root_pageno;
+    let mut index_data = io.read_index_data(latest_index_pgno)?;
+    let mut refnos = Vec::new();
+    
+    // 如果是叶子节点，直接从中提取
+    if index_data.level == 0 {
+        for loc in &index_data.refno_locs {
+            refnos.push(loc.get_refno());
+            if refnos.len() >= count {
+                break;
+            }
+        }
+        return Ok(refnos);
+    }
+    
+    // 如果不是叶子节点，尝试找到一些叶子节点
+    let mut queue = vec![latest_index_pgno];
+    while !queue.is_empty() && refnos.len() < count {
+        let pgno = queue.pop().unwrap();
+        let data = io.read_index_data(pgno)?;
+        
+        if data.level == 0 {
+            // 叶子节点，提取参考号
+            for loc in &data.refno_locs {
+                refnos.push(loc.get_refno());
+                if refnos.len() >= count {
+                    break;
+                }
+            }
+        } else {
+            // 非叶子节点，添加子节点到队列
+            for loc in &data.refno_locs {
+                queue.push(loc.pgno);
+                if queue.len() + refnos.len() > count * 2 {
+                    break;
+                }
+            }
+        }
+    }
+    
+    Ok(refnos)
 }

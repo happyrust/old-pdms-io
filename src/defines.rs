@@ -8,6 +8,8 @@ use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
 use surrealdb::sql::Thing;
+use aios_core::pdms_types::EleOperation;
+use std::str::FromStr;
 
 pub const PAGE_SIZE: usize = 0x800;
 
@@ -117,6 +119,19 @@ impl SessionPageData {
     #[inline]
     pub fn get_id(&self, dbnum: i32) -> [i32; 2] {
         [dbnum, self.sesno]
+    }
+
+    /// 获取指定参考号在当前会话中的操作状态
+    /// 
+    /// 判断参考号在当前会话中的状态是增加、删除还是修改
+    pub fn get_refno_status(&self, _refno: RefU64) -> EleOperation {
+        // 默认情况下，如果参考号存在于当前会话，我们认为它是被添加的
+        // 具体的状态判断需要比较前后会话的数据变化
+        // 在实际情况中，我们需要查看这个会话的所有操作来确定
+        
+        // 这个方法保留在SessionPageData中，但实际上不会被调用
+        // 实际的状态判断逻辑已经转移到了PdmsIO::get_refno_status方法中
+        EleOperation::Add
     }
 
     pub fn gen_sur_json(&self, dbnum: i32) -> String {
@@ -250,64 +265,108 @@ pub struct RootIndexPage {
 }
 
 ///Index 里的数据条目
+/// 参考号数据位置结构体
+/// 
+/// 用于存储PDMS数据库中元素的参考号和其对应的物理存储位置信息
 #[derive(Debug, PartialEq, DekuRead, DekuWrite, Clone)]
 #[deku(endian = "big")]
 pub struct RefnoDataLoc {
+    /// 参考号的高32位
     pub refno_0: u32,
+    /// 参考号的低32位 
     pub refno_1: u32,
+    /// 页号
     pub pgno: u32,
+    /// 页内偏移量,占20位
     #[deku(bits = "20")]
     pub offset: u32,
+    /// 标志位,占12位
     #[deku(bits = "12")]
     pub flag: u16,
 }
 
 impl RefnoDataLoc {
+    /// 获取完整的参考号
+    /// 
+    /// 将高32位和低32位组合成完整的参考号
     #[inline]
     pub fn get_refno(&self) -> RefU64 {
         RefU64::from_two_nums(self.refno_0, self.refno_1)
     }
 
+    /// 获取属性数据的实际偏移量
+    /// 
+    /// 根据页号和页内偏移量计算出实际的字节偏移量
     #[inline]
     pub fn get_att_offset(&self) -> u64 {
         self.pgno as u64 * 0x800 + self.offset as u64 * 2
     }
 }
 
+/// PDMS数据库中的参考号索引页结构
+/// 
+/// 用于存储参考号索引的页面数据结构
 #[derive(Debug, PartialEq, DekuRead, DekuWrite)]
 pub struct RefnoIndexPage {
+    /// 页面类型标识
     #[deku(endian = "big")]
     pub page_type: i32,
+
+    /// 页面标识符
     #[deku(endian = "big")]
     pub noun: i32,
-    //00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00
+
+    /// 未知用途的固定值数组
+    /// 通常为: 00 00 00 02 00 00 00 02 00 00 00 02 00 00 00 00
     #[deku(endian = "big")]
     pub unknowns_0: [i32; 4],
 
+    /// 前一个页面号(Previous Page Number)
+    /// 具体用途待确认
     #[deku(endian = "big")]
-    pub pfno: u32, //还需要搞的清楚一点，这个值到底怎么来的
+    pub pfno: u32,
 
+    /// 存储参考号索引页ID的数组
+    /// 通过自定义reader函数读取
     #[deku(reader = "read_refno_index_pgid(deku::rest, )")]
     pub data_locs: Vec<RefnoIndexPgId>,
 }
 
 //DekuWrite
+/// PDMS数据库中的索引页数据结构
+/// 
+/// 用于存储参考号和其位置信息的索引页数据
 #[derive(Derivative, PartialEq, DekuRead)]
 #[derivative(Debug)]
 #[deku(endian = "big")]
 pub struct IndexPageData {
+    /// 页面类型标识
     pub page_type: i32,
+
+    /// 页面标识符,固定值为0xCC47DF
     #[deku(assert_eq = "0xCC47DF")]
     pub noun: i32,
+
+    /// 索引层级
+    /// 用于表示当前索引页在B树结构中的层级
     pub level: u32,
+
+    /// 未知用途的固定值数组
     pub unknowns: [u32; 3],
+
+    /// 前一个页面号
     pub pfno: u32,
 
+    /// 参考号位置信息列表
+    /// 存储了参考号及其在数据库中的具体位置
     #[deku(reader = "read_refno_data_loc(deku::rest, *level)")]
     pub refno_locs: Vec<RefnoDataLoc>,
+
+    /// 页面剩余的填充字节
+    /// 用于填充页面到固定大小
     #[derivative(Debug = "ignore")]
     #[deku(count = "deku::rest.len()/8")]
-    pub remain_zero_bytes: Vec<u8>, //剩余的余量bytes
+    pub remain_zero_bytes: Vec<u8>,
 }
 
 impl IndexPageData {

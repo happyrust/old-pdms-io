@@ -1,0 +1,175 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in library 'pdms_io'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--lib",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "pdms_io",
+                    "kind": "lib"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'benchmark'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=benchmark",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "benchmark",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'benchmark'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=benchmark",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "benchmark",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'pdms_io'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=pdms_io",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "pdms_io",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'pdms_io'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=pdms_io",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "pdms_io",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'test_get_refno_status'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=test_get_refno_status",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "test_get_refno_status",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'test_get_refno_status'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=test_get_refno_status",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "test_get_refno_status",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'test_index_map'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=test_index_map",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "test_index_map",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        },
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug unit tests in executable 'test_index_map'",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--no-run",
+                    "--bin=test_index_map",
+                    "--package=pdms_io"
+                ],
+                "filter": {
+                    "name": "test_index_map",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
