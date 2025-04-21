@@ -68,7 +68,7 @@ async fn main() -> Result<()> {
     
     let mut found_count = 0;
     for refno in &selected_refnos {
-        match io.search_refno_pgno(*refno) {
+        match io.search_latest_refno(*refno, None) {
             Ok(_) => found_count += 1,
             Err(_) => {}
         }
