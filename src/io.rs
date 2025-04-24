@@ -20,6 +20,7 @@ use std::mem::size_of;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 /// PDMS数据库IO操作结构体
 #[derive(Debug)]
@@ -254,37 +255,102 @@ impl PdmsIO {
     /// # 错误
     /// 当找不到指定参考号时返回错误
     pub fn search_history_refnos(&mut self, refno: RefU64, sesno: Option<u32>) -> anyhow::Result<BTreeMap<u32, u64>> {
-        let mut results = BTreeMap::new();
+        let mut results: BTreeMap<u32, u64> = BTreeMap::new();
         
         // 首先使用search_latest_refno找到当前版本
-        let (current_sesno, refno_offset) = self.search_latest_refno(refno, sesno)?;
+        let (current_sesno, refno_offset) = self.search_latest_refno(refno, sesno)
+            .ok_or_else(|| anyhow::anyhow!("找不到指定参考号: {:?}", refno))?;
         
         // 添加当前版本到结果集
         results.insert(current_sesno, refno_offset);
-        
-        // 从当前会话往前查找所有历史版本
+
+        // 如果指定了会话号，从该会话开始向前查找
+        // 否则从最新会话开始向前查找
         let mut search_sesno = current_sesno as i32;
+        
+        // 不断向前查找历史版本
         loop {
-            // 获取比当前会话小的最近会话号
             match self.get_nearest_less_sesno(search_sesno) {
                 Ok(prev_sesno) => {
-                    // dbg!(prev_sesno);
                     // 尝试在前一个会话中查找
                     match self.search_latest_refno(refno, Some(prev_sesno as u32)) {
-                        Ok((sesno, offset)) => {
+                        Some((sesno, offset)) => {
                             results.insert(sesno, offset);
                             search_sesno = prev_sesno;
                         },
-                        Err(_) => break // 找不到更多历史版本，退出循环
+                        None => break // 找不到更多历史版本，退出循环
                     }
                 },
                 Err(_) => break // 没有更早的会话，退出循环
             }
         }
-        
+
         Ok(results)
     }
 
+    /// 获取参考号在指定会话范围内的操作状态
+    /// 
+    /// # 参数
+    /// * `refno` - 要判断状态的参考号
+    /// * `sesno_range` - 会话号范围，例如(100, 200)表示在会话100到200之间判断该参考号的状态
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<EleOperation>` - 成功返回参考号的操作状态(新增/修改/删除/重复/无操作)
+    /// 
+    /// # 错误
+    /// * 当参考号在指定范围内不存在时返回错误
+    pub async fn get_refno_operation_status(&mut self, refno: RefU64, sesno: Option<u32>) -> anyhow::Result<EleOperation> {
+        // 收集引用号的历史记录
+        let history = self.search_history_refnos(refno, sesno)?;
+        
+        if history.is_empty() {
+            return Ok(EleOperation::None);
+        }
+        
+        // 只有一个版本，说明是新建的
+        if history.len() == 1 {
+            return Ok(EleOperation::Add);
+        }
+        
+        // 获取最新版本的详细信息
+        let (&first_sesno, &first_offset) = history.iter().next().unwrap();
+        
+        //先判断是否发生删除
+        let first_att = self.parse_element(first_offset).await?;
+        let owner = first_att.owner;
+        let owner_ele = self.auto_get_element(owner).await?;
+        if !owner_ele.children.contains(&refno) {
+            return Ok(EleOperation::Deleted);
+        }
+        
+        let (&prev_sesno, &prev_offset) = history.iter().nth(1).unwrap();
+        let prev_att = self.parse_element(prev_offset).await?;
+        //todo 如何判断是否发生修改？
+        // let diff = first_att.att_map().diff(&second_att.att_map());
+        // if diff.is_empty() {
+        //     return Ok(EleOperation::None);
+        // }
+        return Ok(EleOperation::Modified);
+    }
+
+
+    // 搜索指定会话号之前的引用号， 先使用latest_refno， 如果找不到， 则使用search_prev_refno
+    /// 搜索指定参考号在指定会话号之前的版本
+    /// 
+    /// # 参数
+    /// * `refno` - 要搜索的参考号
+    /// * `sesno` - 可选的会话号，用于限定搜索范围
+    /// 
+    /// # 返回值
+    /// * `Option<(u32, u64)>` - 成功返回元组(会话号, 引用号物理地址)，找不到时返回None
+    pub fn search_prev_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
+        let (current_sesno, refno_offset) = self.search_latest_refno(refno, sesno)?;
+        if current_sesno == 0 {
+            return None;
+        }
+        let prev_sesno = self.get_nearest_less_sesno(current_sesno as i32).unwrap();
+        self.search_latest_refno(refno, Some(prev_sesno as u32))
+    }
 
     /// 在数据库中搜索指定参考号的物理存储位置
     /// 
@@ -297,26 +363,26 @@ impl PdmsIO {
     /// 
     /// # 错误
     /// 当找不到指定参考号时返回错误
-    pub fn search_latest_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> anyhow::Result<(u32, u64)> {
-        let basic_info = self.get_page_basic_info()?;
+    pub fn search_latest_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
+        let basic_info = self.get_page_basic_info().ok()?;
         
         // 根据sesno参数决定使用哪个会话的数据
         let latest_index_pgno = if let Some(target_sesno) = sesno {
             // 找到指定会话号对应的页号
             let ses_pgno = match self.sesno_pgno_map.get(&(target_sesno as i32)) {
                 Some(&pgno) => pgno,
-                None => return Err(anyhow::anyhow!("找不到指定的会话号: {}", target_sesno)),
+                None => return None,
             };
             
             // 读取该会话的数据
-            let ses_data = self.read_ses_data(ses_pgno)?;
+            let ses_data = self.read_ses_data(ses_pgno).ok()?;
             ses_data.index_root_pageno
         } else {
             // 使用最新的索引根页号
             basic_info.latest_ses_data.index_root_pageno
         };
         
-        let mut index_data = self.read_index_data(latest_index_pgno)?;
+        let mut index_data = self.read_index_data(latest_index_pgno).ok()?;
         let mut level = index_data.level as i32;
         let (r0, r1) = (refno.get_0(), refno.get_1());
         while level >= 0 {
@@ -334,11 +400,11 @@ impl PdmsIO {
                     )
                 })
             };
-
+                    
             if level == 0 && next_loc_index.is_some() {
                 let loc = &index_data.refno_locs[next_loc_index.unwrap()];
                 let loc_sesno = self.get_sesno(loc.pgno).unwrap_or_default();
-                return Ok((loc_sesno, loc.get_att_offset()));
+                return Some((loc_sesno, loc.get_att_offset()));
             }
 
             if next_loc_index.is_none() && level > 0 {
@@ -350,19 +416,20 @@ impl PdmsIO {
             }
 
             if next_loc_index.is_none() {
-                return Err(anyhow::anyhow!("引用号 {:?} 不存在", refno));
+                return None;
             }
 
+            // 继续向下查找
             if level > 0 {
                 let next_pgno = index_data.refno_locs[next_loc_index.unwrap()].pgno;
-                index_data = self.read_index_data(next_pgno)?;
+                index_data = self.read_index_data(next_pgno).ok()?;
                 level = index_data.level as i32;
             } else {
                 break;
             }
         }
         
-        Err(anyhow::anyhow!("引用号 {:?} 不存在", refno))
+        None
     }
 
     /// 解析增量数据
@@ -373,6 +440,16 @@ impl PdmsIO {
     }
 
     ///获取单个element数据
+    /// 解析单个元素数据
+    /// 
+    /// # 参数
+    /// * `refno_offset` - 元素在文件中的偏移量
+    /// 
+    /// # 返回值
+    /// * `EleData` - 解析后的元素数据
+    /// 
+    /// # 错误
+    /// * 如果文件读取或解析失败,将返回错误
     pub async fn parse_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
         let mut file = self.get_file()?;
         let mut data = vec![0u8; 0x800];
@@ -384,7 +461,7 @@ impl PdmsIO {
         } else {
             &data[..]
         };
-        let mut ele_data = parse_ele_data(input, (refno_offset / 0x800) as _).await?;
+        let mut ele_data = parse_ele_data(input).await?;
         let pgno = (refno_offset / 0x800) as u32;
         let sesno = self.get_sesno(pgno).unwrap_or_default() as i32;
         ele_data.att_map_mut().set_sesno(sesno);
@@ -392,13 +469,33 @@ impl PdmsIO {
     }
 
     //TODO 做一个不处理UDA的方法
+    /// 自动获取单个元素数据
+    /// 
+    /// # 参数
+    /// * `refno` - 要获取的元素的引用号
+    /// 
+    /// # 返回值
+    /// * `EleData` - 元素数据
+    /// 
+    /// # 错误
+    /// * 如果找不到元素或解析失败,将返回错误
     #[inline]
     pub async fn auto_get_element(&mut self, refno: RefU64) -> anyhow::Result<EleData> {
-        let (_, offset) = self.search_latest_refno(refno, None)?;
+        let (_, offset) = self.search_latest_refno(refno, None).ok_or(anyhow!("找不到指定参考号: {:?}", refno))?;
         let mut ele_data = self.parse_element(offset).await?;
         Ok(ele_data)
     }
 
+    /// 深度获取元素及其所有子元素
+    /// 
+    /// # 参数
+    /// * `refno` - 要获取的元素的引用号
+    /// 
+    /// # 返回值
+    /// * `HashMap<RefU64, EleData>` - 包含所有元素的哈希表,key为引用号,value为元素数据
+    /// 
+    /// # 错误
+    /// * 如果获取任何元素失败,将返回错误
     pub async fn auto_get_elements_deep(
         &mut self,
         refno: RefU64,
@@ -2885,84 +2982,104 @@ pub async fn demo_history_query(path: &str, refno: RefU64) -> anyhow::Result<()>
 
 /// 对比原始search_refno_pgno和优化版本search_refno_pgno_optimized的性能
 pub async fn benchmark_search_refno_pgno(path: &str, refnos: &[RefU64], iterations: usize) -> anyhow::Result<()> {
-    println!("执行参考号查询性能测试...");
     let mut io = PdmsIO::new("test", path, true);
     io.open()?;
-    
-    // 预热
-    for refno in refnos.iter() {
-        let _ = io.search_latest_refno(*refno, None);
-        let _ = io.search_refno_pgno_optimized(*refno);
+
+    println!("开始基准测试搜索引用号...");
+    println!("测试引用号数量: {}", refnos.len());
+    println!("每个算法迭代次数: {}", iterations);
+
+    // 测试普通搜索方法
+    let start = Instant::now();
+    let mut success_count = 0;
+
+    for _ in 0..iterations {
+        for &refno in refnos {
+            // 修改这里使用Option而不是Result
+            if let Some(_) = io.search_latest_refno(refno, None) {
+                success_count += 1;
+            }
+        }
     }
 
-    // 测试原始版本
-    let start = std::time::Instant::now();
+    let elapsed = start.elapsed();
+    println!(
+        "原始搜索方法: {:?}, 平均每个引用号: {:?}, 成功率: {:.2}%",
+        elapsed,
+        elapsed / (refnos.len() * iterations) as u32,
+        (success_count as f64 / (refnos.len() * iterations) as f64) * 100.0
+    );
+
+    // 测试优化后的搜索方法
+    let start = Instant::now();
+    let mut success_count = 0;
+
     for _ in 0..iterations {
-        for refno in refnos.iter() {
-            let _ = io.search_latest_refno(*refno, None);
+        for &refno in refnos {
+            if let Ok(_) = io.search_refno_pgno_optimized(refno) {
+                success_count += 1;
+            }
         }
     }
-    let original_duration = start.elapsed();
-    
-    // 测试优化版本
-    let start = std::time::Instant::now();
-    for _ in 0..iterations {
-        for refno in refnos.iter() {
-            let _ = io.search_refno_pgno_optimized(*refno);
-        }
-    }
-    let optimized_duration = start.elapsed();
-    
-    // 输出结果
-    println!("原始版本耗时: {:?}", original_duration);
-    println!("优化版本耗时: {:?}", optimized_duration);
-    
-    // 计算性能提升
-    let speedup = original_duration.as_secs_f64() / optimized_duration.as_secs_f64();
-    println!("性能提升: {:.2}倍", speedup);
-    
+
+    let elapsed = start.elapsed();
+    println!(
+        "优化搜索方法: {:?}, 平均每个引用号: {:?}, 成功率: {:.2}%",
+        elapsed,
+        elapsed / (refnos.len() * iterations) as u32,
+        (success_count as f64 / (refnos.len() * iterations) as f64) * 100.0
+    );
+
     // 验证结果一致性
-    println!("验证结果一致性...");
-    let mut consistent = true;
-    for refno in refnos.iter() {
-        let result1 = io.search_latest_refno(*refno, None);
-        let result2 = io.search_refno_pgno_optimized(*refno);
+    println!("\n验证两种方法结果一致性...");
+    
+    let mut match_count = 0;
+    let mut mismatch_count = 0;
+
+    for &refno in refnos {
+        let result1 = io.search_latest_refno(refno, None);
+        let result2 = io.search_refno_pgno_optimized(refno);
         
-        match (result1, result2) {
-            (Ok((sesno, offset)), Ok(loc2)) => {
+        match (result1, &result2) {
+            (Some((sesno, offset)), Ok(loc2)) => {
                 // 将 (sesno, offset) 与 RefnoDataLoc 结构对比时需要提取sesno对应的页号
                 let ses_pgno = match io.sesno_pgno_map.get(&(sesno as i32)) {
                     Some(&pgno) => pgno,
                     None => {
-                        println!("无法找到会话号 {} 对应的页号", sesno);
-                        consistent = false;
+                        println!("警告: 找不到会话 {} 对应的页号", sesno);
+                        mismatch_count += 1;
                         continue;
                     }
                 };
-                
-                if ses_pgno != loc2.pgno || offset != loc2.get_att_offset() {
-                    println!("参考号 {:?} 查询结果不一致!", refno);
-                    println!("原始版本: 会话号={}, 偏移={}", sesno, offset);
-                    println!("优化版本: 页号={}, 偏移={}", loc2.pgno, loc2.get_att_offset());
-                    consistent = false;
+
+                if ses_pgno == loc2.pgno && offset == loc2.get_att_offset() {
+                    match_count += 1;
+                } else {
+                    println!(
+                        "不匹配: 引用号 {:?}, 方法1: ({}, {}), 方法2: ({}, {})",
+                        refno, sesno, offset, loc2.pgno, loc2.get_att_offset()
+                    );
+                    mismatch_count += 1;
                 }
             }
-            (Err(_), Err(_)) => {
+            (None, Err(_)) => {
                 // 都找不到，结果一致
+                match_count += 1;
             }
             _ => {
-                println!("参考号 {:?} 查询结果不一致: 一个成功，一个失败", refno);
-                consistent = false;
+                println!("不一致: 引用号 {:?}, 方法1: {:?}, 方法2: {:?}", refno, result1, &result2);
+                mismatch_count += 1;
             }
         }
     }
-    
-    if consistent {
-        println!("结果一致性检查通过!");
-    } else {
-        println!("警告: 结果一致性检查失败!");
-    }
-    
+
+    println!(
+        "一致性检查: 匹配 {}, 不匹配 {}, 一致率: {:.2}%",
+        match_count,
+        mismatch_count,
+        (match_count as f64 / (match_count + mismatch_count) as f64) * 100.0
+    );
+
     Ok(())
 }
 

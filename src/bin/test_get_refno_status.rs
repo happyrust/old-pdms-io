@@ -7,14 +7,30 @@ use std::time::Instant;
 #[tokio::main]
 async fn main() -> Result<()> {
     // 获取命令行参数
-    // let args: Vec<String> = env::args().collect();
-    // if args.len() < 3 {
-    //     eprintln!("用法: {} <PDMS数据库文件路径> <参考号>", args[0]);
-    //     return Ok(());
-    // }
-
-    let db_path = r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams1112_0001"#;
-    let refno_str = "17496/497128";
+    let args: Vec<String> = env::args().collect();
+    
+    // 设置默认参数
+    let mut db_path = r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams1112_0001"#;
+    let mut refno_str = "17496/497128";
+    let mut min_sesno = 0;
+    let mut max_sesno = 9999;
+    
+    // 处理命令行参数
+    if args.len() > 1 {
+        db_path = &args[1];
+    }
+    
+    if args.len() > 2 {
+        refno_str = &args[2];
+    }
+    
+    if args.len() > 3 {
+        min_sesno = args[3].parse().unwrap_or(0);
+    }
+    
+    if args.len() > 4 {
+        max_sesno = args[4].parse().unwrap_or(9999);
+    }
     
     // 解析参考号
     let refno = match RefU64::try_from(refno_str) {
@@ -34,11 +50,11 @@ async fn main() -> Result<()> {
     // 首先检查参考号是否存在
     println!("检查参考号是否存在...");
     match io.search_latest_refno(refno, None) {
-        Ok((sesno, offset)) => {
-            println!("参考号存在！会话号={}, 偏移={:#4X}", sesno, offset);
-        },
-        Err(e) => {
-            println!("参考号不存在: {}", e);
+        Some((sesno, offset)) => {
+            println!("引用号 {} 在会话 {} 的偏移量: {}", refno, sesno, offset);
+        }
+        None => {
+            println!("引用号 {} 不存在", refno);
             return Ok(());
         }
     }
@@ -53,6 +69,33 @@ async fn main() -> Result<()> {
         },
         Err(e) => {
             println!("搜索历史记录失败: {}", e);
+        }
+    }
+    
+    // 测试获取参考号操作状态功能
+    println!("\n测试参考号操作状态判断功能...");
+    // println!("会话范围: {} 到 {}", min_sesno, max_sesno);
+    
+    let start = Instant::now();
+    match io.get_refno_operation_status(refno, None).await {
+        Ok(status) => {
+            let elapsed = start.elapsed();
+            
+            println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: {:?}", 
+                     refno, min_sesno, max_sesno, status);
+            
+            match status {
+                EleOperation::Add => println!("解释: 该参考号在此会话范围内是新增的"),
+                EleOperation::Modified => println!("解释: 该参考号在此会话范围内被修改过"),
+                EleOperation::Deleted => println!("解释: 该参考号在此会话范围内被删除了"),
+                EleOperation::Duplicate => println!("解释: 该参考号在此会话范围内有重复记录"),
+                EleOperation::None => println!("解释: 该参考号在此会话范围内没有操作记录"),
+            }
+            
+            println!("状态判断耗时: {:?}", elapsed);
+        },
+        Err(e) => {
+            println!("获取操作状态失败: {}", e);
         }
     }
 

@@ -41,8 +41,10 @@ fn test_watch() {
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct PdmsWatcher {
     pub watch_dirs: Vec<PathBuf>,
+    #[serde(skip)]
     pub headers: DashMap<PathBuf, DbPageBasicInfo>,
     //还需要存储一下每个文件对应的完整目录
+    #[serde(skip)]
     pub file_name_full_path_map: DashMap<String, PathBuf>,
 }
 

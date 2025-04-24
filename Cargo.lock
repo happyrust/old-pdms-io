@@ -91,7 +91,7 @@ dependencies = [
  "chrono",
  "clap",
  "config",
- "dashmap 6.1.0",
+ "dashmap 7.0.0-rc2",
  "deku",
  "derivative",
  "derive_more",
@@ -104,7 +104,7 @@ dependencies = [
  "glam",
  "hash32",
  "hexasphere",
- "id_tree",
+ "id_tree 1.8.0 (git+https://gitee.com/happydpc/id_tree)",
  "indexmap 2.8.0",
  "itertools 0.13.0",
  "jsonxf",
@@ -2003,6 +2003,20 @@ dependencies = [
  "lock_api",
  "once_cell",
  "parking_lot_core",
+]
+
+[[package]]
+name = "dashmap"
+version = "7.0.0-rc2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e4a1e35a65fe0538a60167f0ada6e195ad5d477f6ddae273943596d4a1a5730b"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "equivalent",
+ "hashbrown 0.15.2",
+ "lock_api",
+ "parking_lot_core",
  "serde",
 ]
 
@@ -3224,6 +3238,17 @@ dependencies = [
 [[package]]
 name = "id_tree"
 version = "1.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bcd9db8dd5be8bde5a2624ed4b2dfb74368fe7999eb9c4940fd3ca344b61071a"
+dependencies = [
+ "serde",
+ "serde_derive",
+ "snowflake",
+]
+
+[[package]]
+name = "id_tree"
+version = "1.8.0"
 source = "git+https://gitee.com/happydpc/id_tree#483f2ec03fc107b9195a8c2be6dec5532891b507"
 dependencies = [
  "serde",
@@ -4372,7 +4397,6 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "1.0.0"
-source = "git+https://gitee.com/happydpc/aios-parse-pdms#f29e191c8bdf2a799aebc4eb70dcb17bdaffa415"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -4384,7 +4408,7 @@ dependencies = [
  "clap",
  "concurrent-queue",
  "config",
- "dashmap 6.1.0",
+ "dashmap 7.0.0-rc2",
  "derivative",
  "dynfmt",
  "flate2",
@@ -4392,6 +4416,7 @@ dependencies = [
  "hash32",
  "hash32-derive",
  "hex",
+ "id_tree 1.8.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "instant",
  "itertools 0.13.0",
  "lazy_static",
@@ -4407,7 +4432,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "smol_str 0.3.2",
- "thiserror 2.0.12",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
