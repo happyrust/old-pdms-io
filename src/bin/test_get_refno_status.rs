@@ -87,18 +87,32 @@ async fn main() -> Result<()> {
     
     let start = Instant::now();
     match io.get_refno_operation_status(refno, None) {
-        Ok(status) => {
+        Ok(status_map) => {
             let elapsed = start.elapsed();
             
+            let refno_status = status_map.get(&refno).cloned().unwrap_or(EleOperation::None);
             println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: {:?}", 
-                     refno, min_sesno, max_sesno, status);
+                     refno, min_sesno, max_sesno, refno_status);
             
-            match status {
+            match refno_status {
                 EleOperation::Add => println!("解释: 该参考号在此会话范围内是新增的"),
-                EleOperation::Modified => println!("解释: 该参考号在此会话范围内被修改过"),
+                EleOperation::Modified => println!("解释: 该参考号在此会话范围内被修改过"), 
                 EleOperation::Deleted => println!("解释: 该参考号在此会话范围内被删除了"),
                 EleOperation::Duplicate => println!("解释: 该参考号在此会话范围内有重复记录"),
                 EleOperation::None => println!("解释: 该参考号在此会话范围内没有操作记录"),
+                EleOperation::GeometryModified => println!("解释: 该参考号在此会话范围内几何形状被修改过"),
+            }
+            
+            println!("状态映射中包含 {} 个元素", status_map.len());
+            
+            // 打印子元素的状态
+            if status_map.len() > 1 {
+                println!("子元素状态列表:");
+                for (child_refno, operation) in status_map.iter() {
+                    if *child_refno != refno {
+                        println!(" - 子元素 {} 的状态: {:?}", child_refno, operation);
+                    }
+                }
             }
             
             println!("状态判断耗时: {:?}", elapsed);

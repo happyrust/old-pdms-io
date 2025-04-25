@@ -38,15 +38,17 @@ async fn test_get_refno_status() -> anyhow::Result<()> {
     }
     
     // 在全范围内检查状态
-    let status = io.get_refno_operation_status(refno1, None)?;
-    println!("参考号 {} 在全范围内的状态为: {:?}", refno1, status);
+    let status_map = io.get_refno_operation_status(refno1, None)?;
+    let refno1_status = status_map.get(&refno1).cloned().unwrap_or(EleOperation::None);
+    println!("参考号 {} 在全范围内的状态为: {:?}", refno1, refno1_status);
+    println!("状态映射中包含 {} 个元素", status_map.len());
     
     // 仅在当前会话中检查状态
-    let status = io.get_refno_operation_status(refno1, Some(sesno))?;
-    println!("参考号 {} 在会话 {} 中的状态为: {:?}", refno1, sesno, status);
+    let status_map = io.get_refno_operation_status(refno1, Some(sesno))?;
+    let refno1_status = status_map.get(&refno1).cloned().unwrap_or(EleOperation::None);
+    println!("参考号 {} 在会话 {} 中的状态为: {:?}", refno1, sesno, refno1_status);
+    println!("状态映射中包含 {} 个元素", status_map.len());
 
-
-    
     return Ok(());
 }
 
@@ -61,14 +63,8 @@ fn test_get_refno_operation_status() -> anyhow::Result<()> {
     io.open()?;
     
     // 测试用例1: 使用一个存在多个版本的参考号
-    let refno1: RefU64 = "17496/171606".into();
+    let refno1: RefU64 = "17496/497129".into();
 
-    let test1 = io.search_latest_refno(refno1, Some(733)).unwrap();
-    dbg!(test1);
-    let test2 = io.search_latest_refno(refno1, Some(1159)).unwrap();
-    dbg!(test2);
-
-    // return Ok(());
 
     let history = io.search_history_refnos(refno1, None)?;
     
@@ -86,14 +82,18 @@ fn test_get_refno_operation_status() -> anyhow::Result<()> {
 
         
         // 测试最早会话的状态(应该是Add)
-        let status1 = io.get_refno_operation_status(refno1, Some(earliest_sesno))?;
+        let status1_map = io.get_refno_operation_status(refno1, Some(earliest_sesno))?;
+        let status1 = status1_map.get(&refno1).cloned().unwrap_or(EleOperation::None);
         println!("参考号 {} 在最早会话 {} 中的状态为: {:?}", refno1, earliest_sesno, status1);
         assert_eq!(status1, EleOperation::Add, "最早会话的状态应该是Add");
+        println!("状态映射中包含 {} 个元素", status1_map.len());
         
         // 测试第二个会话的状态(应该是Modified)
-        let status2 = io.get_refno_operation_status(refno1, Some(second_sesno))?;
+        let status2_map = io.get_refno_operation_status(refno1, Some(second_sesno))?;
+        let status2 = status2_map.get(&refno1).cloned().unwrap_or(EleOperation::None);
         println!("参考号 {} 在第二个会话 {} 中的状态为: {:?}", refno1, second_sesno, status2);
         assert_eq!(status2, EleOperation::Modified, "第二个会话的状态应该是Modified");
+        println!("状态映射中包含 {} 个元素", status2_map.len());
         
     } else {
         println!("参考号 {} 只有一个版本，跳过多版本测试", refno1);
@@ -102,7 +102,11 @@ fn test_get_refno_operation_status() -> anyhow::Result<()> {
     // 测试用例2: 测试一个不存在的参考号
     let refno2: RefU64 = "99999/99999".into();
     match io.get_refno_operation_status(refno2, None) {
-        Ok(status) => println!("不存在的参考号状态为: {:?}", status),
+        Ok(status_map) => {
+            let status = status_map.get(&refno2).cloned().unwrap_or(EleOperation::None);
+            println!("不存在的参考号状态为: {:?}", status);
+            println!("状态映射中包含 {} 个元素", status_map.len());
+        },
         Err(e) => println!("预期的错误: {}", e)
     }
     
