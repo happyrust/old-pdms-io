@@ -271,17 +271,17 @@ impl PdmsIO {
         // 不断向前查找历史版本
         loop {
             match self.get_nearest_less_sesno(search_sesno) {
-                Ok(prev_sesno) => {
+                Some(prev_sesno) => {
                     // 尝试在前一个会话中查找
                     match self.search_latest_refno(refno, Some(prev_sesno as u32)) {
                         Some((sesno, offset)) => {
                             results.insert(sesno, offset);
-                            search_sesno = prev_sesno;
+                            search_sesno = sesno as i32;
                         },
                         None => break // 找不到更多历史版本，退出循环
                     }
                 },
-                Err(_) => break // 没有更早的会话，退出循环
+                None => break // 没有更早的会话，退出循环
             }
         }
 
@@ -299,34 +299,41 @@ impl PdmsIO {
     /// 
     /// # 错误
     /// * 当参考号在指定范围内不存在时返回错误
-    pub async fn get_refno_operation_status(&mut self, refno: RefU64, sesno: Option<u32>) -> anyhow::Result<EleOperation> {
-        // 收集引用号的历史记录
-        let history = self.search_history_refnos(refno, sesno)?;
+    pub fn get_refno_operation_status(&mut self, refno: RefU64, sesno: Option<u32>) -> anyhow::Result<EleOperation> {
+        // 使用search_latest_and_prev_refno获取最新版本和前一个版本
+        let [latest, previous] = self.search_latest_and_prev_refno(refno, sesno);
+
+        // dbg!(&latest);
+        // dbg!(&previous);
         
-        if history.is_empty() {
+        // 如果没有找到任何版本
+        if latest.is_none() {
             return Ok(EleOperation::None);
         }
         
         // 只有一个版本，说明是新建的
-        if history.len() == 1 {
+        if previous.is_none() {
             return Ok(EleOperation::Add);
         }
         
-        // 获取最新版本的详细信息
-        let (&first_sesno, &first_offset) = history.iter().next().unwrap();
+        // 解包最新版本
+        let (latest_sesno, latest_offset) = latest.unwrap();
         
-        //先判断是否发生删除
-        let first_att = self.parse_element(first_offset).await?;
-        let owner = first_att.owner;
-        let owner_ele = self.auto_get_element(owner).await?;
+        // 先判断是否发生删除
+        let (latest_att, _) = self.parse_raw_element(latest_offset).unwrap();
+        let owner = latest_att.owner;
+        //todo 直接调用 parse children 方法
+        let (owner_ele, _) = self.auto_get_raw_element(owner)?;
         if !owner_ele.children.contains(&refno) {
             return Ok(EleOperation::Deleted);
         }
         
-        let (&prev_sesno, &prev_offset) = history.iter().nth(1).unwrap();
-        let prev_att = self.parse_element(prev_offset).await?;
+        // 解包前一个版本
+        let (prev_sesno, prev_offset) = previous.unwrap();
+        let (prev_att, _) = self.parse_raw_element(prev_offset).unwrap();
+        
         //todo 如何判断是否发生修改？
-        // let diff = first_att.att_map().diff(&second_att.att_map());
+        // let diff = latest_att.att_map().diff(&prev_att.att_map());
         // if diff.is_empty() {
         //     return Ok(EleOperation::None);
         // }
@@ -343,13 +350,20 @@ impl PdmsIO {
     /// 
     /// # 返回值
     /// * `Option<(u32, u64)>` - 成功返回元组(会话号, 引用号物理地址)，找不到时返回None
-    pub fn search_prev_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
-        let (current_sesno, refno_offset) = self.search_latest_refno(refno, sesno)?;
-        if current_sesno == 0 {
-            return None;
+    pub fn search_latest_and_prev_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> [Option<(u32, u64)>; 2] {
+        //dbg!(sesno);
+        if let Some(current_data) = self.search_latest_refno(refno, sesno) {
+            // dbg!(current_data);
+            if current_data.0 == 0 {
+                return [None, None];
+            }
+            
+            let prev_data = self.get_nearest_less_sesno(current_data.0 as i32).and_then(|prev_sesno| {
+                self.search_latest_refno(refno, Some(prev_sesno as u32))
+            });
+            return [Some(current_data), prev_data];
         }
-        let prev_sesno = self.get_nearest_less_sesno(current_sesno as i32).unwrap();
-        self.search_latest_refno(refno, Some(prev_sesno as u32))
+        [None, None]
     }
 
     /// 在数据库中搜索指定参考号的物理存储位置
@@ -364,27 +378,31 @@ impl PdmsIO {
     /// # 错误
     /// 当找不到指定参考号时返回错误
     pub fn search_latest_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
-        let basic_info = self.get_page_basic_info().ok()?;
-        
+        // dbg!(sesno);
         // 根据sesno参数决定使用哪个会话的数据
         let latest_index_pgno = if let Some(target_sesno) = sesno {
+            // dbg!(self.ses_range_map.get(&(target_sesno as i32)));
             // 找到指定会话号对应的页号
             let ses_pgno = match self.sesno_pgno_map.get(&(target_sesno as i32)) {
                 Some(&pgno) => pgno,
                 None => return None,
             };
-            
             // 读取该会话的数据
             let ses_data = self.read_ses_data(ses_pgno).ok()?;
             ses_data.index_root_pageno
         } else {
+            let basic_info = self.get_page_basic_info().ok()?;
+            // dbg!(basic_info.latest_ses_data.sesno);
             // 使用最新的索引根页号
             basic_info.latest_ses_data.index_root_pageno
         };
+
+        // dbg!(latest_index_pgno);
         
         let mut index_data = self.read_index_data(latest_index_pgno).ok()?;
         let mut level = index_data.level as i32;
         let (r0, r1) = (refno.get_0(), refno.get_1());
+        //refno_locs 必须是递增的，如果遇到小的值了，说明遇到删除的参考号了
         while level >= 0 {
             let mut next_loc_index = if level == 0 {
                 index_data
@@ -393,26 +411,22 @@ impl PdmsIO {
                     .position(|x| x.refno_0 == r0 && x.refno_1 == r1)
             } else {
                 index_data.refno_locs.windows(2).position(|x| {
-                    (x[1].refno_0 > r0 && x[0].refno_0 <= r0)   //r0的范围找到后，可以停止
-                        || (
-                        (r0 >= x[0].refno_0 && r1 >= x[0].refno_1)
-                            && (r0 <= x[1].refno_0 && r1 < x[1].refno_1)
-                    )
+                    let x0 = RefU64::from_two_nums(x[0].refno_0, x[0].refno_1);
+                    let x1 = RefU64::from_two_nums(x[1].refno_0, x[1].refno_1);
+                    (x1 > x0 && refno >= x0 && refno < x1) || (x1 < x0 )
                 })
             };
                     
             if level == 0 && next_loc_index.is_some() {
                 let loc = &index_data.refno_locs[next_loc_index.unwrap()];
                 let loc_sesno = self.get_sesno(loc.pgno).unwrap_or_default();
+                // dbg!(loc.pgno);
                 return Some((loc_sesno, loc.get_att_offset()));
             }
 
-            if next_loc_index.is_none() && level > 0 {
+            if next_loc_index.is_none() && level > 0 && !index_data.refno_locs.is_empty() {
                 // 尝试找到第一个大于当前refno的位置
-                next_loc_index = index_data
-                    .refno_locs
-                    .iter()
-                    .position(|x| x.refno_0 > r0 || (x.refno_0 == r0 && x.refno_1 > r1));
+                next_loc_index = Some(index_data.refno_locs.len() - 1);
             }
 
             if next_loc_index.is_none() {
@@ -468,6 +482,30 @@ impl PdmsIO {
         Ok(ele_data)
     }
 
+    /// 解析原始元素数据, 不处理UDA
+    /// 
+    /// # 参数
+    /// * `refno_offset` - 元素在文件中的偏移量
+    /// 
+    pub fn parse_raw_element(&mut self, refno_offset: u64) -> anyhow::Result<(EleData, Vec<u8>)> {
+        let mut file = self.get_file()?;
+        let mut data = vec![0u8; 0x800];
+        file.seek(SeekFrom::Start(refno_offset))?;
+        file.read_exact(&mut data)?;
+
+        let input = if data[..4] == [0, 0, 0, 0x7] {
+            &data[4..]
+        } else {
+            &data[..]
+        };
+        let (mut ele_data, bytes) = parse_raw_ele_data(input)?;
+        let pgno = (refno_offset / 0x800) as u32;
+        let sesno = self.get_sesno(pgno).unwrap_or_default() as i32;
+        ele_data.att_map_mut().set_sesno(sesno);
+        Ok((ele_data, bytes))
+    }
+
+
     //TODO 做一个不处理UDA的方法
     /// 自动获取单个元素数据
     /// 
@@ -484,6 +522,13 @@ impl PdmsIO {
         let (_, offset) = self.search_latest_refno(refno, None).ok_or(anyhow!("找不到指定参考号: {:?}", refno))?;
         let mut ele_data = self.parse_element(offset).await?;
         Ok(ele_data)
+    }
+
+    #[inline]
+    pub fn auto_get_raw_element(&mut self, refno: RefU64) -> anyhow::Result<(EleData, Vec<u8>)> {
+        let (_, offset) = self.search_latest_refno(refno, None).ok_or(anyhow!("找不到指定参考号: {:?}", refno))?;
+        let (ele_data, bytes) = self.parse_raw_element(offset)?;
+        Ok((ele_data, bytes))
     }
 
     /// 深度获取元素及其所有子元素
@@ -552,6 +597,24 @@ impl PdmsIO {
     }
 
     ///读取ses data
+    /// 读取会话页数据
+    /// 
+    /// # 参数
+    /// * `ses_pgno` - 会话页号
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<&SessionPageData>` - 成功返回会话页数据的引用,失败返回错误
+    /// 
+    /// # 错误
+    /// * 当无法读取指定页号的会话数据时返回错误
+    /// 
+    /// # 实现细节
+    /// 1. 首先检查缓存中是否已存在该页数据
+    /// 2. 如果不存在,则:
+    ///    - 读取文件指定位置的数据
+    ///    - 将数据解析为SessionPageData结构
+    ///    - 设置页号并存入缓存
+    /// 3. 从缓存中返回数据
     #[inline]
     pub fn read_ses_data(&mut self, ses_pgno: u32) -> anyhow::Result<&SessionPageData> {
         if !self.ses_data_map.contains_key(&ses_pgno) {
@@ -576,6 +639,16 @@ impl PdmsIO {
             .ok_or(anyhow!("Can't read ses page with {ses_pgno}."));
     }
 
+    /// 获取指定会话号的会话数据
+    /// 
+    /// # 参数
+    /// * `sesno` - 要获取数据的会话号
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<&SessionPageData>` - 成功返回会话数据的引用,失败返回错误
+    /// 
+    /// # 错误
+    /// * 当找不到指定会话号对应的页面时返回错误
     pub fn get_ses_data(&mut self, sesno: u32) -> anyhow::Result<&SessionPageData> {
         if let Some(cur_ses_pgno) = self.get_ses_pageno(sesno as _) {
             self.read_ses_data(cur_ses_pgno)
@@ -593,16 +666,13 @@ impl PdmsIO {
     /// * 如果存在大于等于目标会话号的最小会话号,返回该会话号
     /// * 否则返回最大的会话号
     /// * 如果没有任何会话号,返回原始会话号
-    pub fn get_nearest_large_sesno(&mut self, sesno: i32) -> anyhow::Result<i32> {
-        let mut near_sesno = 0;
+    pub fn get_nearest_large_sesno(&mut self, sesno: i32) -> Option<i32> {
         // 查找大于等于目标会话号的最小会话号
         if let Some(next_sesno) = self.sesno_pgno_map.keys().filter(|&&s| s >= sesno).min() {
-            near_sesno = *next_sesno;
-            // 如果没有找到,则返回最大的会话号
-        } else if let Some(&last_sesno) = self.sesno_pgno_map.keys().max() {
-            near_sesno = last_sesno;
+            Some(*next_sesno)
+        } else {
+            None
         }
-        Ok(near_sesno)
     }
 
     /// 获取最接近指定会话号的较小会话号
@@ -613,15 +683,33 @@ impl PdmsIO {
     /// # 返回值
     /// * 如果存在小于目标会话号的最大会话号,返回该会话号
     /// * 否则返回原始会话号
-    pub fn get_nearest_less_sesno(&mut self, sesno: i32) -> anyhow::Result<i32> {
-        let mut near_sesno = sesno;
+    pub fn get_nearest_less_sesno(&mut self, sesno: i32) -> Option<i32> {
         // 查找小于目标会话号的最大会话号
         if let Some(prev_sesno) = self.sesno_pgno_map.keys().filter(|&&s| s < sesno).max() {
-            near_sesno = *prev_sesno;
+            Some(*prev_sesno)
+        } else {
+            None
         }
-        Ok(near_sesno)
     }
 
+    /// 读取索引页数据
+    /// 
+    /// # 参数
+    /// * `index_pgno` - 索引页号
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<IndexPageData>` - 成功返回索引页数据,失败返回错误
+    /// 
+    /// # 错误
+    /// * 读取文件失败时返回错误
+    /// * 解析索引页数据失败时返回错误
+    /// 
+    /// # 实现细节
+    /// 1. 获取文件句柄
+    /// 2. 分配一个页大小的缓冲区
+    /// 3. 定位到指定页号的位置
+    /// 4. 读取整页数据
+    /// 5. 将数据解析为索引页结构
     #[inline]
     pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<IndexPageData> {
         let file = self.get_file()?;
@@ -784,14 +872,12 @@ impl PdmsIO {
         let mut all_his_att_json_map: HashMap<String, Vec<String>> = HashMap::new();
         let mut pe_op_map: HashMap<RefnoEnum, (EleOperation, u32)> = HashMap::new();
         let mut ses_op_map: HashMap<u32, Vec<EleOperation>> = HashMap::new();
-        let debug_refno: RefU64 = "17496/171606".into();
         //将历史纪录都存储在 his_relate 里， owner 为当前最新的 pe
         //如果没有历史记录，则不存储，减小额外的存储
         let mut deleted_refnos_map = BTreeMap::new();
         //只添加了一次的数据纪录,  todo 需要排查是否有数据在删除里，需要特殊处理
         let mut added_only_refnos_map = BTreeMap::new();
         for (&refno, offset_set) in &history_pe_map {
-            let is_debug = debug_refno == refno;
             let mut prev_children = Vec::new();
             let mut prev_att_json = None;
             let loc_len = offset_set.len();
@@ -817,17 +903,15 @@ impl PdmsIO {
                     break;
                 }
                 let is_last = i == loc_len - 1;
-                let Ok(ele_data) = self.parse_element(offset).await else {
-                    continue;
-                };
+                let (ele_data, _) = self.parse_raw_element(offset).unwrap();
                 let att = ele_data.att_map();
                 let mut pe = att.pe(dbnum);
                 if !is_last {
                     all_sesnos.insert(sesno);
                 }
-                if is_debug {
-                    dbg!(&att);
-                }
+                // if is_debug {
+                //     dbg!(&att);
+                // }
 
                 //如果是第二个 json 开始，都是 modified
                 //todo需要实际检查是否真的 json 数据发生变化
@@ -856,10 +940,10 @@ impl PdmsIO {
                         ses_op_map.entry(sesno).or_default().push(EleOperation::Add);
                     }
                 }
-                if is_debug {
-                    // dbg!(&prev_children);
-                    // dbg!(&ele_data.children);
-                }
+                // if is_debug {
+                //     // dbg!(&prev_children);
+                //     // dbg!(&ele_data.children);
+                // }
                 for &child in prev_children.iter() {
                     let refno_sesno = RefnoSesno::new(child, sesno);
                     //如果是 add，在当前 sesno 一定会有
@@ -1533,11 +1617,25 @@ impl PdmsIO {
         }
     }
 
+    /// 根据会话号获取对应的页码
+    /// 
+    /// # 参数
+    /// * `sesno` - 会话号
+    /// 
+    /// # 返回值
+    /// * `Option<u32>` - 如果找到对应的页码则返回Some(页码),否则返回None
     #[inline]
     pub fn get_ses_pageno(&self, sesno: i32) -> Option<u32> {
         self.sesno_pgno_map.get(&sesno).cloned()
     }
 
+    /// 收集指定会话中的所有引用号位置信息
+    /// 
+    /// # 参数
+    /// * `sesno` - 会话号
+    /// 
+    /// # 返回值
+    /// * `Vec<RefnoDataLoc>` - 引用号位置信息的集合,如果会话不存在则返回空集合
     #[inline]
     pub fn collect_refno_locs(&mut self, sesno: i32) -> Vec<RefnoDataLoc> {
         self.get_ses_pageno(sesno)
@@ -1545,6 +1643,21 @@ impl PdmsIO {
             .unwrap_or_default()
     }
 
+    /// 收集指定会话中的所有引用号位置信息
+    /// 
+    /// 该函数读取指定会话页中的所有引用号位置信息,并过滤出在该会话中有效的引用号。
+    /// 
+    /// # 参数
+    /// * `ses_pgno` - 会话页号
+    /// 
+    /// # 返回值
+    /// * `Vec<RefnoDataLoc>` - 引用号位置信息的集合
+    /// 
+    /// # 实现细节
+    /// 1. 读取当前会话的结束页号、上一个会话页号和索引根页号
+    /// 2. 读取上一个会话的结束页号
+    /// 3. 过滤出页号在上一个会话结束页号和当前会话结束页号之间的引用号
+    /// 4. 递归处理索引页数据,收集所有符合条件的引用号位置信息
     pub fn collect_refno_locs_in_session(&mut self, ses_pgno: u32) -> Vec<RefnoDataLoc> {
         //读取当前会话层有多少属性保存了，是否需要读取 index 数据，然后开始读取属性数据
         //过滤 index 里面的 pgno 大于当前会话的 pgno 的数据
@@ -1588,6 +1701,22 @@ impl PdmsIO {
     }
 
     ///过滤 index page data 里面的数据
+    /// 过滤索引页数据
+    /// 
+    /// # 参数
+    /// * `index_data` - 索引页数据
+    /// * `result_locs` - 用于存储过滤后的引用号位置信息
+    /// * `last_end_pgno` - 上一个会话的结束页号
+    /// * `cur_end_pgno` - 当前会话的结束页号
+    /// * `level` - 当前索引页的层级
+    /// 
+    /// # 返回值
+    /// * `Option<bool>` - 成功返回Some(true),失败返回None
+    /// 
+    /// # 实现细节
+    /// 1. 过滤出页号在上一个会话结束页号和当前会话结束页号之间的引用号
+    /// 2. 如果是叶子节点(level=0),直接将过滤结果添加到result_locs
+    /// 3. 如果是非叶子节点,递归处理下一层索引页
     pub fn filter_index_data(
         &mut self,
         index_data: &IndexPageData,
@@ -1617,11 +1746,7 @@ impl PdmsIO {
             for l in cur_locs {
                 // dbg!(l.pgno);
                 if let Ok(next_index_data) = self.read_index_data(l.pgno) {
-                    // if next_index_data.pfno != 253 {
-                    //     continue;
-                    // }
                     let mut next_level = next_index_data.level as i32;
-                    //todo make clear why exist this situation
                     if next_level >= *level {
                         // dbg!((next_level, *level));
                         // dbg!((&l, next_index_data));
@@ -1640,81 +1765,90 @@ impl PdmsIO {
         Some(true)
     }
 
+
     /// 收集session范围内的增删改的element数据
     /// 并在这里即可判断是否增删改？
-    pub async fn collect_increment_eles(
+    /// 收集指定会话范围内的增量元素数据
+    /// 
+    /// # 参数
+    /// * `sesno_range` - 会话号范围(包含起始和结束值)，如果为None则使用最新会话
+    /// 
+    /// # 返回值
+    /// * `anyhow::Result<HashMap<RefU64, (EleOperation, Option<EleData>)>>` - 返回一个映射,键为参考号,值为元组:
+    ///   - 第一个元素是操作类型(增加/修改/删除等)
+    ///   - 第二个元素是可选的元素数据(删除操作时为None)
+    /// 
+    /// # 错误
+    /// * 当读取或解析元素数据失败时返回错误
+    pub fn collect_increment_eles(
         &mut self,
-        sesno_range: RangeInclusive<i32>,
-    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
+        sesno_range: Option<RangeInclusive<i32>>,
+    ) -> anyhow::Result<HashMap<RefU64, (EleOperation, Option<EleData>)>> {
         let mut eles_map = HashMap::new();
+        let mut processed_refnos = HashSet::new();
 
-        for sesno in sesno_range.into_iter().rev() {
-            let final_locs = self.collect_refno_locs(sesno);
-            //从后往前查看，如果是已经有了数据，就不需要再往里面加了
-            for loc in final_locs {
-                if let Ok(ele) = self.parse_element(loc.get_att_offset()).await {
-                    eles_map.insert(ele.refno, ele);
-                }
+        // 处理sesno_range为None的情况，获取最新会话号
+        let session_numbers = match sesno_range {
+            Some(range) => range.collect::<Vec<i32>>(),
+            None => {
+                // 如果为None，只使用最新会话
+                let latest_sesno = self.get_latest_sesno()? as i32;
+                vec![latest_sesno]
             }
-        }
-        Ok(eles_map)
-    }
+        };
 
-    //直接读取中间这段数据的att index table，直接获取所有需要的数据
-    pub async fn collect_increment_eles_old(
-        &mut self,
-        till_pageno: u32,
-    ) -> anyhow::Result<HashMap<RefU64, EleData>> {
-        let mut file = self.get_file()?;
-        let mut input = vec![];
-        let start = till_pageno as u64 * 0x800;
-        #[cfg(feature = "debug_parse")]
-        println!("Bytes start at : {:#04X?}", start);
-        file.seek(SeekFrom::Start(start))
-            .expect("collect_increment_eles");
-        file.read_to_end(&mut input)?;
-        let mut pos_iter = rfind_iter(&input, &REFNO_LEAF_INDEX_PAGE[..]);
-        // let mut max_pgno = 0;
-        let mut refno_data_offsets_map = BTreeMap::new();
-        while let Some(mut pos) = pos_iter.next() {
-            pos += start as usize;
-            #[cfg(feature = "debug_parse")]
-            println!("Found leaf index page at: {:#04X?}", pos);
-            let index_data = self.read_index_data((pos / 0x800) as _)?;
-            for x in index_data.refno_locs {
-                if x.pgno < till_pageno {
+        // 从高到低处理会话号
+        for &sesno in session_numbers.iter().rev() {
+            let final_locs = self.collect_refno_locs(sesno);
+            
+            for loc in final_locs {
+                let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
+                
+                // 如果已经处理过这个引用号，则跳过
+                if processed_refnos.contains(&refno) {
                     continue;
                 }
-                let refno_att_offset = x.get_att_offset();
-                #[cfg(feature = "debug_parse")]
-                println!(
-                    "Found loc: {:#04X?}, att_offset: {:#04X}",
-                    &x, refno_att_offset
-                );
-                let refno = RefU64::from_two_nums(x.refno_0, x.refno_1);
-                if !refno_data_offsets_map.contains_key(&refno) {
-                    refno_data_offsets_map.insert(refno, refno_att_offset);
-                }
-            }
-        }
-
-        let mut eles_map = HashMap::new();
-        for (refno, offset) in refno_data_offsets_map {
-            match self.parse_element(offset).await {
-                Ok(ele) => {
-                    eles_map.insert(ele.refno, ele);
-                }
-                Err(e) => {
-                    #[cfg(feature = "debug_parse")]
-                    {
-                        dbg!((refno, offset, e));
+                
+                // 标记为已处理
+                processed_refnos.insert(refno);
+                
+                // 使用get_refno_operation_status获取操作状态
+                let operation = self.get_refno_operation_status(refno, Some(sesno as u32))?;
+                
+                // 根据操作类型决定是否需要解析元素数据
+                match operation {
+                    EleOperation::None => {
+                        // 无操作，跳过
+                        continue;
+                    },
+                    EleOperation::Deleted => {
+                        // 已删除，不需要元素数据
+                        eles_map.insert(refno, (operation, None));
+                    },
+                    EleOperation::Duplicate => {
+                        // 重复元素，与Modified处理相同
+                        if let Ok((ele, _)) = self.parse_raw_element(loc.get_att_offset()) {
+                            eles_map.insert(refno, (operation, Some(ele)));
+                        } else {
+                            // 解析失败，仍然记录操作类型
+                            eles_map.insert(refno, (operation, None));
+                        }
+                    },
+                    EleOperation::Add | EleOperation::Modified => {
+                        // 新增或修改，需要解析元素数据
+                        if let Ok((ele, _)) = self.parse_raw_element(loc.get_att_offset()) {
+                            eles_map.insert(refno, (operation, Some(ele)));
+                        } else {
+                            // 解析失败，仍然记录操作类型
+                            eles_map.insert(refno, (operation, None));
+                        }
                     }
                 }
             }
         }
+        
         Ok(eles_map)
     }
-
 
     /// 搜索参考号是否存在
     /// 

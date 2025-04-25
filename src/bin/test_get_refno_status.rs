@@ -59,6 +59,15 @@ async fn main() -> Result<()> {
         }
     }
 
+     //测试search_latest_and_prev_refno
+     let [current, prev] = io.search_latest_and_prev_refno(refno, None);
+     if let Some((current_sesno, current_offset)) = current {
+         println!("参考号 {} 在当前会话 {} 中的偏移是 {:#4X}", refno, current_sesno, current_offset);
+         if let Some((prev_sesno, prev_offset)) = prev {
+             println!("参考号 {} 在前一个会话 {} 中的偏移是 {:#4X}", refno, prev_sesno, prev_offset);
+         }
+     }
+
     println!("搜索参考号的历史记录...");
     match io.search_history_refnos(refno, None) {
         Ok(history) => {
@@ -77,7 +86,7 @@ async fn main() -> Result<()> {
     // println!("会话范围: {} 到 {}", min_sesno, max_sesno);
     
     let start = Instant::now();
-    match io.get_refno_operation_status(refno, None).await {
+    match io.get_refno_operation_status(refno, None) {
         Ok(status) => {
             let elapsed = start.elapsed();
             

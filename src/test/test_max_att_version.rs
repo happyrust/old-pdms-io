@@ -14,6 +14,6 @@ pub async fn test_get_max_att_pgno() {
     let max_att_version = io.get_latest_sesno().unwrap();
     dbg!(max_att_version);
 
-    let incr_eles = io.collect_increment_eles(1109..=1111).await.unwrap();
+    let incr_eles = io.collect_increment_eles(Some( 1109..=1111)).unwrap();
     dbg!(&incr_eles.keys());
 }
