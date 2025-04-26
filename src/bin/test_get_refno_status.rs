@@ -1,6 +1,7 @@
 use anyhow::Result;
 use aios_core::pdms_types::{EleOperation, RefU64};
-use pdms_io::io::PdmsIO;
+use pdms_io::io::{PdmsIO, EleOperationDetail};
+use aios_core::NamedAttrValue;
 use std::env;
 use std::time::Instant;
 
@@ -90,17 +91,82 @@ async fn main() -> Result<()> {
         Ok(status_map) => {
             let elapsed = start.elapsed();
             
-            let refno_status = status_map.get(&refno).cloned().unwrap_or(EleOperation::None);
-            println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: {:?}", 
-                     refno, min_sesno, max_sesno, refno_status);
-            
-            match refno_status {
-                EleOperation::Add => println!("解释: 该参考号在此会话范围内是新增的"),
-                EleOperation::Modified => println!("解释: 该参考号在此会话范围内被修改过"), 
-                EleOperation::Deleted => println!("解释: 该参考号在此会话范围内被删除了"),
-                EleOperation::Duplicate => println!("解释: 该参考号在此会话范围内有重复记录"),
-                EleOperation::None => println!("解释: 该参考号在此会话范围内没有操作记录"),
-                EleOperation::GeometryModified => println!("解释: 该参考号在此会话范围内几何形状被修改过"),
+            let refno_status = status_map.get(&refno).cloned();
+            match &refno_status {
+                Some(EleOperationDetail::Add(ele_data)) => {
+                    println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 新增", 
+                         refno, min_sesno, max_sesno);
+                    println!("解释: 该参考号在此会话范围内是新增的");
+                    println!("元素属性数量: {}", ele_data.att_map().len());
+                },
+                Some(EleOperationDetail::Modified { 
+                    added_attrs, 
+                    deleted_attrs, 
+                    modified_attrs,
+                    added_explicit_attrs,
+                    deleted_explicit_attrs,
+                    modified_explicit_attrs,
+                    added_uda_attrs,
+                    deleted_uda_attrs,
+                    modified_uda_attrs,
+                }) => {
+                    println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 已修改", 
+                         refno, min_sesno, max_sesno);
+                    println!("解释: 该参考号在此会话范围内被修改过");
+                    
+                    // 显示属性变化详情
+                    if !added_attrs.is_empty() {
+                        println!("新增属性数量: {}", added_attrs.len());
+                        for (name, value) in added_attrs {
+                            println!("  - 新增属性: {} = {}", name, value.string_value());
+                        }
+                    }
+                    
+                    if !deleted_attrs.is_empty() {
+                        println!("删除属性数量: {}", deleted_attrs.len());
+                        for (name, value) in deleted_attrs {
+                            println!("  - 删除属性: {} = {}", name, value.string_value());
+                        }
+                    }
+                    
+                    if !modified_attrs.is_empty() {
+                        println!("修改属性数量: {}", modified_attrs.len());
+                        for (name, (old_value, new_value)) in modified_attrs {
+                            println!("  - 修改属性: {} = {} -> {}", name, old_value.string_value(), new_value.string_value());
+                        }
+                    }
+                    
+                    // 显示显式属性变化
+                    if !added_explicit_attrs.is_empty() || !deleted_explicit_attrs.is_empty() || !modified_explicit_attrs.is_empty() {
+                        println!("显式属性变化:");
+                        println!("  - 新增: {}, 删除: {}, 修改: {}", 
+                            added_explicit_attrs.len(), 
+                            deleted_explicit_attrs.len(), 
+                            modified_explicit_attrs.len());
+                    }
+                    
+                    // 显示UDA属性变化
+                    if !added_uda_attrs.is_empty() || !deleted_uda_attrs.is_empty() || !modified_uda_attrs.is_empty() {
+                        println!("UDA属性变化:");
+                        println!("  - 新增: {}, 删除: {}, 修改: {}", 
+                            added_uda_attrs.len(), 
+                            deleted_uda_attrs.len(), 
+                            modified_uda_attrs.len());
+                    }
+                },
+                Some(EleOperationDetail::Deleted) => {
+                    println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 已删除", 
+                         refno, min_sesno, max_sesno);
+                    println!("解释: 该参考号在此会话范围内被删除了");
+                },
+                Some(EleOperationDetail::None) => {
+                    println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 无操作", 
+                         refno, min_sesno, max_sesno);
+                    println!("解释: 该参考号在此会话范围内没有操作记录");
+                },
+                None => {
+                    println!("参考号 {} 在状态映射中不存在", refno);
+                }
             }
             
             println!("状态映射中包含 {} 个元素", status_map.len());
