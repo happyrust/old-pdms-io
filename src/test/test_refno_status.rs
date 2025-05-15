@@ -38,14 +38,14 @@ async fn test_get_refno_status() -> anyhow::Result<()> {
     }
     
     // 在全范围内检查状态
-    let status_map = io.get_refno_operation_status(refno1, None)?;
-    println!("参考号 {} 在全范围内的状态为: {:?}", refno1, status_map.get(&refno1));
-    println!("状态映射中包含 {} 个元素", status_map.len());
+    // let status_map = io.get_refno_operation_status(refno1, None)?;
+    // println!("参考号 {} 在全范围内的状态为: {:?}", refno1, status_map.get(&refno1));
+    // println!("状态映射中包含 {} 个元素", status_map.len());
     
-    // 仅在当前会话中检查状态
-    let status_map = io.get_refno_operation_status(refno1, Some(sesno))?;
-    println!("参考号 {} 在会话 {} 中的状态为: {:?}", refno1, sesno, status_map.get(&refno1));
-    println!("状态映射中包含 {} 个元素", status_map.len());
+    // // 仅在当前会话中检查状态
+    // let status_map = io.get_refno_operation_status(refno1, Some(sesno))?;
+    // println!("参考号 {} 在会话 {} 中的状态为: {:?}", refno1, sesno, status_map.get(&refno1));
+    // println!("状态映射中包含 {} 个元素", status_map.len());
 
     return Ok(());
 }

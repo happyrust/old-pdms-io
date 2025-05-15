@@ -36,3 +36,6 @@
   否则，表示是为 Duplicate，添加字段 Operation::Duplicate，检查 json 是否一致。最新的数据只需要 update 一下就可以了，不用删除，
 
 - 准备两个 json 能够对比差异的 ui，采用表格的形式？
+
+
+实现增量更新的解析，是否需要实现多线程去快速读取到upsert的变化

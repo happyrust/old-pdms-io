@@ -8,7 +8,7 @@ use aios_core::{
 use anyhow::{anyhow, Result};
 use atty::is;
 use chrono::{DateTime, Utc};
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, StreamExt};
 use memchr::memmem::rfind_iter;
 use parse_pdms_db::parse::*;
@@ -20,9 +20,10 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::sync::RwLock;
+use rayon::prelude::*;
 
 /// 已修改元素的详细信息
 #[derive(Clone)]
@@ -50,6 +51,76 @@ pub struct ModifiedElement {
 }
 
 impl ModifiedElement {
+    
+    /// 生成SurrealQL的UPSERT MERGE语句，用于将ModifiedElement的修改应用到数据库
+    ///
+    /// # 参数
+    /// * `id` - 要修改的记录ID
+    ///
+    /// # 返回值
+    /// 返回完整的SurrealQL UPSERT MERGE语句
+    pub fn to_surql(&self, id: &str) -> String {
+        let mut main_fields = serde_json::Map::new();
+        let mut uda_attrs = serde_json::Map::new();
+        
+        // 处理新增的普通属性
+        for (key, attr) in &self.added_attrs {
+            main_fields.insert(key.clone(), attr.clone().into());
+        }
+        
+        // 处理修改的普通属性
+        for (key, (_, new_attr)) in &self.modified_attrs {
+            main_fields.insert(key.clone(), new_attr.clone().into());
+        }
+        
+        // 处理删除的普通属性
+        for key in self.deleted_attrs.keys() {
+            main_fields.insert(key.clone(), serde_json::Value::Null);
+        }
+        
+        // 处理新增的显式属性（直接添加到main_fields）
+        for (key, attr) in &self.added_explicit_attrs {
+            main_fields.insert(key.clone(), attr.clone().into());
+        }
+        
+        // 处理修改的显式属性（直接添加到main_fields）
+        for (key, (_, new_attr)) in &self.modified_explicit_attrs {
+            main_fields.insert(key.clone(), new_attr.clone().into());
+        }
+        
+        // 处理删除的显式属性（直接添加到main_fields）
+        for key in self.deleted_explicit_attrs.keys() {
+            main_fields.insert(key.clone(), serde_json::Value::Null);
+        }
+        
+        // 处理新增的UDA属性
+        for (key, attr) in &self.added_uda_attrs {
+            uda_attrs.insert(key.to_string(), attr.clone().into());
+        }
+        
+        // 处理修改的UDA属性
+        for (key, (_, new_attr)) in &self.modified_uda_attrs {
+            uda_attrs.insert(key.to_string(), new_attr.clone().into());
+        }
+        
+        // 处理删除的UDA属性
+        for key in self.deleted_uda_attrs.keys() {
+            uda_attrs.insert(key.to_string(), serde_json::Value::Null);
+        }
+        
+        // 如果有UDA属性，将它们添加到主对象中
+        // if !uda_attrs.is_empty() {
+        //     main_fields.insert("uda_attrs".to_string(), serde_json::Value::Object(uda_attrs));
+        // }
+        
+        // 构建完整的UPSERT MERGE语句
+        format!(
+            "UPSERT {}:{} MERGE {};",
+            self.noun,
+            id,
+            serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
+        )
+    }
     
     /// 获取所有属性名称
     pub fn att_names(&self) -> HashSet<String> {
@@ -88,7 +159,102 @@ pub enum EleOperationDetail {
     None,
 }
 
+/// 元素操作数据，包含操作明细、参考号和会话号
+#[derive(Clone)]
+pub struct EleOperationData {
+    /// 参考号
+    pub refno: RefU64,
+    /// 会话号
+    pub sesno: u32,
+    /// 操作明细
+    pub detail: EleOperationDetail,
+}
+
+impl EleOperationData {
+    /// 创建新的元素操作数据
+    pub fn new(refno: RefU64, sesno: u32, detail: EleOperationDetail) -> Self {
+        Self { refno, sesno, detail }
+    }
+    
+    /// 获取操作类型
+    pub fn get_op_type(&self) -> &'static str {
+        self.detail.get_op_type()
+    }
+    
+    /// 获取元素类型
+    pub fn get_noun_type(&self) -> String {
+        self.detail.get_noun_type()
+    }
+    
+    /// 检查是否为几何体变化
+    pub fn is_geometry_change(&self) -> bool {
+        self.detail.is_geometry_change()
+    }
+    
+    /// 检查是否为变换（位置旋转等）变化
+    pub fn is_transform_change(&self) -> bool {
+        self.detail.is_transform_change()
+    }
+    
+    /// 将操作状态转换为SurrealQL语句
+    pub fn to_surql(&self, id: &str) -> String {
+        self.detail.to_surql(id)
+    }
+}
+
+/// 将RefU64到EleOperationDetail的映射转换为EleOperationData向量
+pub fn convert_to_operation_data(
+    map: HashMap<RefU64, EleOperationDetail>, 
+    sesno: u32
+) -> Vec<EleOperationData> {
+    map.into_iter()
+        .map(|(refno, detail)| EleOperationData::new(refno, sesno, detail))
+        .collect()
+}
+
 impl EleOperationDetail {
+    /// 根据操作类型生成SurrealQL语句
+    ///
+    /// # 参数
+    /// * `id` - 要操作的记录ID
+    ///
+    /// # 返回值
+    /// 返回完整的SurrealQL语句（CREATE/UPSERT/DELETE）
+    pub fn to_surql(&self, id: &str) -> String {
+        match self {
+            // 新增元素：使用CREATE语句
+            Self::Add(ele_data) => {
+                let mut main_fields = serde_json::Map::new();
+                
+                // 添加所有属性
+                for (key, value) in ele_data.att_map().iter() {
+                    main_fields.insert(key.clone(), serde_json::to_value(value).unwrap_or(serde_json::Value::Null));
+                }
+                
+                // 构建CREATE语句
+                format!(
+                    "CREATE {}:{} CONTENT {};",
+                    ele_data.att_map().get_type(),
+                    id,
+                    serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
+                )
+            },
+            
+            // 修改元素：使用UPSERT MERGE语句
+            Self::Modified(modified_element) => {
+                modified_element.to_surql(id)
+            },
+            
+            // 删除元素：使用DELETE语句
+            Self::Deleted(noun_type) => {
+                format!("UPDATE {}:{} SET deleted = true;", noun_type, id)
+            },
+            
+            // 无操作：返回空字符串
+            Self::None => String::new(),
+        }
+    }
+
     /// 获取操作类型
     pub fn get_op_type(&self) -> &'static str {
         match self {
@@ -210,6 +376,7 @@ impl std::fmt::Debug for EleOperationDetail {
                     has_changes = true;
                     writeln!(f, "  修改属性 ({}):", ele.modified_attrs.len())?;
                     for (name, (old_val, new_val)) in &ele.modified_attrs {
+                        // dbg!(&new_val);
                         writeln!(
                             f,
                             "    - {}: {} -> {}",
@@ -688,10 +855,10 @@ impl PdmsIO {
         // 检查普通属性的变化
         while let Some((noun, value)) = latest_att.att_map_mut().pop_first() {
             if let Some(prev_value) = prev_att.att_map_mut().remove(&noun) {
-                if noun == "SPRE" && refno == "17496_171604".into() {
-                    dbg!(&value);
-                    dbg!(&prev_value);
-                }
+                // if noun == "SPRE" && refno == "17496_171604".into() {
+                //     dbg!(&value);
+                //     dbg!(&prev_value);
+                // }
                 if value != prev_value {
                     is_changed = true;
                     modified_attrs.insert(noun, (prev_value.clone(), value));
@@ -2247,23 +2414,30 @@ impl PdmsIO {
     pub fn collect_increment_eles(
         &mut self,
         sesno_range: Option<RangeInclusive<i32>>,
-    ) -> anyhow::Result<HashMap<RefU64, EleOperationDetail>> {
-        let mut result_map = HashMap::new();
+    ) -> anyhow::Result<HashMap<u32, Vec<EleOperationData>>> {
         let mut processed_refnos = HashSet::new();
+        // 按会话号分组结果
+        let mut grouped_results: HashMap<u32, Vec<EleOperationData>> = HashMap::new();
 
-        // 处理sesno_range为None的情况，获取最新会话号
-        let session_numbers = match sesno_range {
-            Some(range) => range.collect::<Vec<i32>>(),
+        //根据与实际的sesno_range 进行一个过滤
+        let session_numbers = match &sesno_range {
+            Some(range) => self.ses_range_map.keys()
+                .filter(|&sesno| range.contains(sesno))
+                .cloned()
+                .collect::<Vec<i32>>(),
             None => {
                 // 如果为None，只使用最新会话
                 let latest_sesno = self.get_latest_sesno()? as i32;
                 vec![latest_sesno]
             }
         };
+        dbg!(&session_numbers.len());
 
         // 从高到低处理会话号
         for &sesno in session_numbers.iter().rev() {
+            println!("collect sesno: {}", sesno);
             let final_locs = self.collect_refno_locs(sesno);
+            let mut operation_details_for_sesno = HashMap::new();
 
             for loc in final_locs {
                 let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
@@ -2278,14 +2452,18 @@ impl PdmsIO {
                 let operation_details =
                     self.get_refno_operation_status(refno, Some(sesno as u32))?;
 
-                // 合并结果
-                for (ref_no, detail) in operation_details {
-                    result_map.insert(ref_no, detail);
-                }
+                // 合并到当前会话的结果
+                operation_details_for_sesno.extend(operation_details);
+            }
+            
+            // 将当前会话的结果转换为 EleOperationData 向量
+            let operation_data = convert_to_operation_data(operation_details_for_sesno, sesno as u32);
+            if !operation_data.is_empty() {
+                grouped_results.insert(sesno as u32, operation_data);
             }
         }
-
-        Ok(result_map)
+        
+        Ok(grouped_results)
     }
 
     /// 搜索参考号是否存在
@@ -2919,8 +3097,9 @@ impl PdmsIO {
         &mut self,
         sesno_range: RangeInclusive<i32>,
         index_map: &BTreeMap<RefU64, BTreeSet<u64>>,
-    ) -> anyhow::Result<HashMap<RefU64, EleOperationDetail>> {
-        let mut eles_map = HashMap::new();
+    ) -> anyhow::Result<HashMap<u32, Vec<EleOperationData>>> {
+        // 按会话号分组结果
+        let mut grouped_results: HashMap<u32, Vec<EleOperationData>> = HashMap::new();
 
         // 获取范围内的所有会话号
         let mut sesnos: Vec<i32> = self
@@ -2940,6 +3119,7 @@ impl PdmsIO {
             if let Some(ses_pgno) = self.get_ses_pageno(sesno) {
                 // 收集当前会话中的所有引用号位置
                 let locs = self.collect_refno_locs_in_session(ses_pgno);
+                let mut session_operations: Vec<EleOperationData> = Vec::new();
 
                 println!("会话 {} 包含 {} 个元素引用", sesno, locs.len());
 
@@ -2956,18 +3136,30 @@ impl PdmsIO {
                             if offset == latest_offset {
                                 let operation_details =
                                     self.get_refno_operation_status(refno, Some(sesno as u32))?;
+                                
+                                // 将操作详情转换为操作数据并添加到本会话的结果中
                                 for (ref_no, detail) in operation_details {
-                                    eles_map.insert(ref_no, detail);
+                                    session_operations.push(EleOperationData {
+                                        refno: ref_no,
+                                        sesno: sesno as u32,
+                                        detail,
+                                    });
                                 }
                             }
                         }
                     }
                 }
+                
+                // 如果本会话有操作数据，添加到分组结果
+                if !session_operations.is_empty() {
+                    grouped_results.insert(sesno as u32, session_operations);
+                }
             }
         }
 
-        println!("增量收集完成，共 {} 个元素", eles_map.len());
-        Ok(eles_map)
+        println!("增量收集完成，共 {} 个会话的数据", grouped_results.len());
+        
+        Ok(grouped_results)
     }
 
     /// 缓存索引映射表，避免重复构建
@@ -3369,10 +3561,11 @@ impl PdmsIO {
     pub fn collect_recent_n_sessions_eles(
         &mut self,
         top_n: Option<u32>,
-    ) -> anyhow::Result<HashMap<RefU64, EleOperationDetail>> {
+    ) -> anyhow::Result<HashMap<u32, Vec<EleOperationData>>> {
         let all_sesnos: Vec<i32> = self.sesno_pgno_map.keys().copied().collect();
 
         if all_sesnos.is_empty() {
+            // 返回空的映射
             return Ok(HashMap::new());
         }
 
@@ -3928,4 +4121,41 @@ pub fn extract_test_refnos(io: &mut PdmsIO, count: usize) -> anyhow::Result<Vec<
     }
 
     Ok(refnos)
+}
+
+/// 基准测试函数，比较并行和非并行收集元素的性能
+///
+/// # 参数
+/// * `path` - 数据库文件路径
+///
+/// # 返回值
+/// * `anyhow::Result<()>` - 如果测试成功返回Ok
+///
+/// # 错误
+/// * 如果打开数据库或执行查询失败，返回错误
+pub async fn benchmark_increment_eles(path: &str) -> anyhow::Result<()> {
+    use std::time::Instant;
+    
+    println!("正在加载数据库: {}", path);
+    let mut io = PdmsIO::new("test", path, true);
+    io.open()?;
+    
+    // 获取最近20个会话
+    let latest_sesno = io.get_latest_sesno()? as i32;
+    let start_sesno = latest_sesno.saturating_sub(10
+    );
+    let sesno_range = start_sesno..=latest_sesno;
+    
+    println!("测试范围: 会话 {} 到 {} (共20个会话)", start_sesno, latest_sesno);
+    
+    // 测试非并行版本
+    println!("开始测试非并行版本...");
+    let start_time = Instant::now();
+    let result1 = io.collect_increment_eles(Some(sesno_range.clone()))?;
+    let non_parallel_time = start_time.elapsed();
+    println!("非并行版本耗时: {:?}", non_parallel_time);
+    println!("收集到 {} 个元素", result1.len());
+    
+    
+    Ok(())
 }
