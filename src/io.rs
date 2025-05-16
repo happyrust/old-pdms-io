@@ -51,6 +51,101 @@ pub struct ModifiedElement {
 }
 
 impl ModifiedElement {
+
+
+    ///生成json patch的语句
+    pub fn to_patch_json(&self) -> String {
+        let mut operations = Vec::new();
+        
+        // 处理新增的普通属性
+        for (key, attr) in &self.added_attrs {
+            let value: serde_json::Value = attr.clone().into();
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": key,
+                "value": value
+            }));
+        }
+        
+        // 处理删除的普通属性
+        for (key, _) in &self.deleted_attrs {
+            operations.push(serde_json::json!({
+                "op": "remove",
+                "path": key
+            }));
+        }
+        
+        // 处理修改的普通属性
+        for (key, (old_value, new_value)) in &self.modified_attrs {
+            let value: serde_json::Value = new_value.clone().into();
+            let old_value: serde_json::Value = old_value.clone().into();
+            operations.push(serde_json::json!({
+                "op": "replace",
+                "path": key,
+                "value": value,
+                "old": old_value
+            }));
+        }
+        
+        // 处理新增的显式属性
+        for (key, attr) in &self.added_explicit_attrs {
+            let value: serde_json::Value = attr.clone().into();
+            operations.push(serde_json::json!({
+                "op": "add",
+                "path": format!("{}", key),
+                "value": value
+            }));
+        }
+        
+        // 处理删除的显式属性
+        for (key, _) in &self.deleted_explicit_attrs {
+            operations.push(serde_json::json!({
+                "op": "remove",
+                "path": format!("{}", key)
+            }));
+        }
+        
+        // 处理修改的显式属性
+        for (key, (old_value, new_value)) in &self.modified_explicit_attrs {
+            let value: serde_json::Value = new_value.clone().into();
+            let old_value: serde_json::Value = old_value.clone().into();
+            operations.push(serde_json::json!({
+                "op": "replace",
+                "path": format!("{}", key),
+                "value": value,
+                "old": old_value
+            }));
+        }
+        
+        // // 处理新增的UDA属性
+        // for (key, attr) in &self.added_uda_attrs {
+        //     operations.push(serde_json::json!({
+        //         "op": "add",
+        //         "path": format!("uda/{}", key),
+        //         "value": serde_json::to_value(attr.clone()).unwrap_or(serde_json::Value::Null)
+        //     }));
+        // }
+        
+        // // 处理删除的UDA属性
+        // for (key, _) in &self.deleted_uda_attrs {
+        //     operations.push(serde_json::json!({
+        //         "op": "remove",
+        //         "path": format!("uda/{}", key)
+        //     }));
+        // }
+        
+        // // 处理修改的UDA属性
+        // for (key, (_, new_value)) in &self.modified_uda_attrs {
+        //     operations.push(serde_json::json!({
+        //         "op": "replace",
+        //         "path": format!("uda/{}", key),
+        //         "value": serde_json::to_value(new_value.clone()).unwrap_or(serde_json::Value::Null)
+        //     }));
+        // }
+        
+        // 序列化为字符串
+        serde_json::to_string(&operations).unwrap_or_default()
+    }
     
     /// 生成SurrealQL的UPSERT MERGE语句，用于将ModifiedElement的修改应用到数据库
     ///
@@ -62,15 +157,27 @@ impl ModifiedElement {
     pub fn to_surql(&self, id: &str) -> String {
         let mut main_fields = serde_json::Map::new();
         let mut uda_attrs = serde_json::Map::new();
+
+        let mut records_sql = String::new();
         
+        //todo， 如果是Vec<RefU64>的，也需要处理一下
+
         // 处理新增的普通属性
         for (key, attr) in &self.added_attrs {
-            main_fields.insert(key.clone(), attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = attr {
+                records_sql.push_str(&format!("{key}: pe:{refno}"));
+            } else {
+                main_fields.insert(key.clone(), attr.clone().into());
+            }
         }
         
         // 处理修改的普通属性
         for (key, (_, new_attr)) in &self.modified_attrs {
-            main_fields.insert(key.clone(), new_attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = new_attr {
+                records_sql.push_str(&format!("{key}: pe:{refno}"));
+            } else {
+                main_fields.insert(key.clone(), new_attr.clone().into());
+            }
         }
         
         // 处理删除的普通属性
@@ -78,29 +185,45 @@ impl ModifiedElement {
             main_fields.insert(key.clone(), serde_json::Value::Null);
         }
         
-        // 处理新增的显式属性（直接添加到main_fields）
+        // 处理新增的显式属性
         for (key, attr) in &self.added_explicit_attrs {
-            main_fields.insert(key.clone(), attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = attr {
+                records_sql.push_str(&format!("{key}: pe:{refno}"));
+            } else {
+                main_fields.insert(key.clone(), attr.clone().into());
+            }
         }
         
-        // 处理修改的显式属性（直接添加到main_fields）
+        // 处理修改的显式属性
         for (key, (_, new_attr)) in &self.modified_explicit_attrs {
-            main_fields.insert(key.clone(), new_attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = new_attr {
+                records_sql.push_str(&format!("{key}: pe:{refno}"));
+            } else {
+                main_fields.insert(key.clone(), new_attr.clone().into());
+            }
         }
         
-        // 处理删除的显式属性（直接添加到main_fields）
+        // 处理删除的显式属性
         for key in self.deleted_explicit_attrs.keys() {
             main_fields.insert(key.clone(), serde_json::Value::Null);
         }
         
         // 处理新增的UDA属性
         for (key, attr) in &self.added_uda_attrs {
-            uda_attrs.insert(key.to_string(), attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = attr {
+                uda_attrs.insert(key.to_string(), serde_json::json!({ "type": "refno", "value": format!("pe:{refno}") }));
+            } else {
+                uda_attrs.insert(key.to_string(), attr.clone().into());
+            }
         }
         
         // 处理修改的UDA属性
         for (key, (_, new_attr)) in &self.modified_uda_attrs {
-            uda_attrs.insert(key.to_string(), new_attr.clone().into());
+            if let NamedAttrValue::RefU64Type(refno) = new_attr {
+                uda_attrs.insert(key.to_string(), serde_json::json!({ "type": "refno", "value": format!("pe:{refno}") }));
+            } else {
+                uda_attrs.insert(key.to_string(), new_attr.clone().into());
+            }
         }
         
         // 处理删除的UDA属性
@@ -108,18 +231,33 @@ impl ModifiedElement {
             uda_attrs.insert(key.to_string(), serde_json::Value::Null);
         }
         
-        // 如果有UDA属性，将它们添加到主对象中
-        // if !uda_attrs.is_empty() {
-        //     main_fields.insert("uda_attrs".to_string(), serde_json::Value::Object(uda_attrs));
-        // }
+        // 如果有UDA属性，则添加到main_fields中
+        if !uda_attrs.is_empty() {
+            main_fields.insert("uda".to_string(), serde_json::Value::Object(uda_attrs));
+        }
         
-        // 构建完整的UPSERT MERGE语句
-        format!(
-            "UPSERT {}:{} MERGE {};",
-            self.noun,
-            id,
-            serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
-        )
+        // 构建完整的SurrealQL语句
+        if main_fields.is_empty() && records_sql.is_empty() {
+            return String::new();
+        }
+        
+        let fields_is_empty = main_fields.is_empty();
+        // 生成JSON字符串
+        let fields_json = serde_json::Value::Object(main_fields).to_string();
+        
+        // 组合最终的SQL语句
+        if records_sql.is_empty() {
+            if fields_is_empty {
+                return String::new();
+            }
+            format!("UPDATE {} MERGE {}", id, fields_json)
+        } else {
+            // 添加逗号分隔符（如果需要）
+            if !fields_is_empty {
+                records_sql.push_str(&format!("{}, {}", records_sql, fields_json));
+            }
+            format!("UPDATE {} MERGE {{ {} }}", id, records_sql)
+        }
     }
     
     /// 获取所有属性名称
@@ -236,7 +374,8 @@ impl EleOperationDetail {
                     "CREATE {}:{} CONTENT {};",
                     ele_data.att_map().get_type(),
                     id,
-                    serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
+                    // serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
+                    ele_data.att_map().gen_sur_json().unwrap()
                 )
             },
             
