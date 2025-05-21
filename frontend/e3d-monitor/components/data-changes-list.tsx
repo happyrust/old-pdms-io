@@ -1,13 +1,13 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useMemo } from "react"
 import { PlusCircle, MinusCircle, Edit, Clock, User, Search, ChevronDown, Hash } from "lucide-react"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { getElementChanges } from "@/lib/surrealdb"
+import { getElementChanges, isDatabaseConnected, checkDatabaseConnection } from "@/lib/surrealdb"
 
 interface DataChangesListProps {
   limit?: number
@@ -30,38 +30,103 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
   const [searchTerm, setSearchTerm] = useState("")
   const [filterType, setFilterType] = useState<string | null>(null)
   const [changes, setChanges] = useState<ChangeRecord[]>([])
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [offset, setOffset] = useState(0)
   const [hasMore, setHasMore] = useState(true)
+  const [dbConnected, setDbConnected] = useState(false)
+  const [connectionError, setConnectionError] = useState<string | null>(null)
 
-  // 加载数据
+  // 检查数据库连接状态
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true)
+    let isMounted = true;
+    const checkConnection = async () => {
       try {
-        const data = await getElementChanges(limit, offset)
-        setChanges(prevChanges => offset === 0 ? data : [...prevChanges, ...data])
-        setHasMore(data.length === limit)
+        const isConnected = await checkDatabaseConnection()
+        if (isMounted) {
+          setDbConnected(isConnected)
+          if (isConnected) {
+            setConnectionError(null)
+          } else {
+            setConnectionError("数据库未连接，请稍后再试")
+          }
+        }
       } catch (error) {
-        console.error("获取变更数据失败:", error)
-      } finally {
-        setLoading(false)
+        console.error("检查数据库连接失败:", error)
+        if (isMounted) {
+          setDbConnected(false)
+          setConnectionError("检查数据库连接时出错")
+        }
       }
     }
 
-    fetchData()
-  }, [limit, offset])
+    checkConnection()
+    // 每30秒检查一次连接状态
+    const interval = setInterval(checkConnection, 30000)
+    return () => {
+      isMounted = false;
+      clearInterval(interval)
+    }
+  }, [])
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
+  // 加载数据
+  useEffect(() => {
+    let isMounted = true;
+    const fetchData = async () => {
+      if (!dbConnected) {
+        return
+      }
+      
+      setLoading(true)
+      try {
+        const data = await getElementChanges(limit, offset)
+        if (isMounted) {
+          setChanges(prevChanges => {
+            if (offset === 0) {
+              return data as unknown as ChangeRecord[];
+            } else {
+              return [...prevChanges, ...(data as unknown as ChangeRecord[])];
+            }
+          });
+          setHasMore(data.length === limit)
+        }
+      } catch (error) {
+        console.error("获取变更数据失败:", error)
+        if (isMounted) {
+          setConnectionError("获取数据失败，请稍后重试")
+        }
+      } finally {
+        if (isMounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    if (dbConnected) {
+      fetchData()
+    }
+    
+    return () => {
+      isMounted = false;
+    }
+  }, [limit, offset, dbConnected])
+
+  const formatDate = (dateString: string): string => {
+    if (!dateString) {
+      return "日期不可用";
+    }
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      console.warn(`Invalid time value received in DataChangesList: ${dateString}`);
+      return "无效日期";
+    }
     return new Intl.DateTimeFormat("zh-CN", {
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
-    }).format(date)
-  }
+    }).format(date);
+  };
 
   const getTypeIcon = (type: string) => {
     switch (type) {
@@ -89,8 +154,9 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
     }
   }
 
-  const filteredChanges = changes
-    .filter((change) => {
+  // 使用useMemo来缓存过滤后的数据，避免在渲染过程中进行计算
+  const filteredChanges = useMemo(() => {
+    return changes.filter((change) => {
       if (filterType && change.operation_type !== filterType) return false
       if (
         searchTerm &&
@@ -101,9 +167,12 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
       }
       return true
     })
+  }, [changes, filterType, searchTerm]);
 
   const loadMore = () => {
-    setOffset(prevOffset => prevOffset + limit)
+    if (!loading) {
+      setOffset(prevOffset => prevOffset + limit)
+    }
   }
 
   return (
@@ -134,10 +203,24 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
         </DropdownMenu>
       </div>
 
+      {connectionError && (
+        <div className="flex items-center justify-center py-4">
+          <div className="text-center bg-red-50 p-4 rounded-md border border-red-200">
+            <p className="text-red-500">{connectionError}</p>
+          </div>
+        </div>
+      )}
+
       {loading && changes.length === 0 ? (
         <div className="flex items-center justify-center py-8">
           <div className="text-center">
             <p className="text-muted-foreground">加载中...</p>
+          </div>
+        </div>
+      ) : !dbConnected ? (
+        <div className="flex items-center justify-center py-8">
+          <div className="text-center">
+            <p className="text-muted-foreground">等待数据库连接...</p>
           </div>
         </div>
       ) : filteredChanges.length === 0 ? (
@@ -160,8 +243,8 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredChanges.map((change) => (
-                  <TableRow key={change.id}>
+                {filteredChanges.map((change, index) => (
+                  <TableRow key={`${change.id}-${index}`}>
                     <TableCell>
                       <div className="flex items-center gap-2">
                         {getTypeIcon(change.operation_type)}
@@ -191,7 +274,11 @@ export function DataChangesList({ limit = 20 }: DataChangesListProps) {
 
           {hasMore && (
             <div className="flex justify-center">
-              <Button variant="outline" onClick={loadMore} disabled={loading}>
+              <Button 
+                variant="outline" 
+                onClick={loadMore} 
+                disabled={loading || !dbConnected}
+              >
                 {loading ? "加载中..." : "加载更多"}
               </Button>
             </div>

@@ -244,19 +244,20 @@ impl ModifiedElement {
         let fields_is_empty = main_fields.is_empty();
         // 生成JSON字符串
         let fields_json = serde_json::Value::Object(main_fields).to_string();
+        let id = format!("{}:{}", &self.noun, id);
         
         // 组合最终的SQL语句
         if records_sql.is_empty() {
             if fields_is_empty {
                 return String::new();
             }
-            format!("UPDATE {} MERGE {}", id, fields_json)
+            format!("UPSERT {} MERGE {}", id, fields_json)
         } else {
             // 添加逗号分隔符（如果需要）
             if !fields_is_empty {
                 records_sql.push_str(&format!("{}, {}", records_sql, fields_json));
             }
-            format!("UPDATE {} MERGE {{ {} }}", id, records_sql)
+            format!("UPSERT {} MERGE {{ {} }}", id, records_sql)
         }
     }
     

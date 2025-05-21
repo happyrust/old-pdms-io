@@ -1,11 +1,11 @@
 "use client"
 
-import { useState, useEffect } from "react"
+import { useState, useEffect, useMemo } from "react"
 import { Clock, BookOpen, Hash, Search } from "lucide-react"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
-import { getSessions, getChangesBySession } from "@/lib/surrealdb"
+import { getSessions, getChangesBySession, checkDatabaseConnection, isDatabaseConnected } from "@/lib/surrealdb"
 import { Badge } from "@/components/ui/badge"
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from "@/components/ui/dialog"
 
@@ -38,26 +38,76 @@ export function SessionList() {
   const [sessionChanges, setSessionChanges] = useState<SessionChangeRecord[]>([])
   const [loadingChanges, setLoadingChanges] = useState(false)
   const [dialogOpen, setDialogOpen] = useState(false)
+  const [dbConnected, setDbConnected] = useState(false)
+  const [connectionError, setConnectionError] = useState<string | null>(null)
 
-  // 加载会话数据
+  // 检查数据库连接状态
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true)
+    let isMounted = true;
+    const checkConnection = async () => {
       try {
-        const data = await getSessions()
-        setSessions(data)
+        const isConnected = await checkDatabaseConnection()
+        if (isMounted) {
+          setDbConnected(isConnected)
+          setConnectionError(null)
+        }
       } catch (error) {
-        console.error("获取会话数据失败:", error)
-      } finally {
-        setLoading(false)
+        if (isMounted) {
+          setDbConnected(false)
+          setConnectionError("无法连接到数据库，请检查连接配置")
+          console.error("数据库连接检查失败:", error)
+        }
       }
     }
 
-    fetchData()
+    checkConnection()
+    // 每30秒检查一次连接状态
+    const interval = setInterval(checkConnection, 30000)
+    return () => {
+      isMounted = false;
+      clearInterval(interval)
+    }
   }, [])
+
+  // 加载会话数据
+  useEffect(() => {
+    let isMounted = true;
+    const fetchData = async () => {
+      if (!dbConnected) {
+        return
+      }
+      
+      setLoading(true)
+      try {
+        const data = await getSessions()
+        if (isMounted) {
+          setSessions(data as unknown as Session[])
+        }
+      } catch (error) {
+        console.error("获取会话数据失败:", error)
+      } finally {
+        if (isMounted) {
+          setLoading(false)
+        }
+      }
+    }
+
+    if (dbConnected) {
+      fetchData()
+    }
+    
+    return () => {
+      isMounted = false;
+    }
+  }, [dbConnected])
 
   // 查看会话变更详情
   const viewSessionChanges = async (session: Session) => {
+    if (!dbConnected) {
+      setConnectionError("数据库未连接，无法获取会话详情")
+      return
+    }
+    
     setSelectedSession(session)
     setLoadingChanges(true)
     setDialogOpen(true)
@@ -65,7 +115,7 @@ export function SessionList() {
     try {
       const sessionId = session.id.split(':')[1]
       const changes = await getChangesBySession(sessionId)
-      setSessionChanges(changes)
+      setSessionChanges(changes as unknown as SessionChangeRecord[])
     } catch (error) {
       console.error("获取会话变更数据失败:", error)
     } finally {
@@ -73,19 +123,27 @@ export function SessionList() {
     }
   }
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
+  const formatDate = (dateString: string): string => {
+    if (!dateString) {
+      return "日期不可用";
+    }
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      console.warn(`Invalid time value received in SessionList: ${dateString}`);
+      return "无效日期";
+    }
     return new Intl.DateTimeFormat("zh-CN", {
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
       hour: "2-digit",
       minute: "2-digit",
-    }).format(date)
-  }
+    }).format(date);
+  };
 
-  const filteredSessions = sessions
-    .filter((session) => {
+  // 使用useMemo缓存过滤后的会话数据，避免每次渲染时重新计算
+  const filteredSessions = useMemo(() => {
+    return sessions.filter((session) => {
       if (
         searchTerm &&
         !session.project.toLowerCase().includes(searchTerm.toLowerCase()) &&
@@ -95,6 +153,7 @@ export function SessionList() {
       }
       return true
     })
+  }, [sessions, searchTerm])
 
   return (
     <div className="space-y-4">
@@ -108,10 +167,24 @@ export function SessionList() {
         />
       </div>
 
+      {connectionError && (
+        <div className="flex items-center justify-center py-4">
+          <div className="text-center bg-red-50 p-4 rounded-md border border-red-200">
+            <p className="text-red-500">{connectionError}</p>
+          </div>
+        </div>
+      )}
+
       {loading ? (
         <div className="flex items-center justify-center py-8">
           <div className="text-center">
             <p className="text-muted-foreground">加载中...</p>
+          </div>
+        </div>
+      ) : !dbConnected ? (
+        <div className="flex items-center justify-center py-8">
+          <div className="text-center">
+            <p className="text-muted-foreground">等待数据库连接...</p>
           </div>
         </div>
       ) : filteredSessions.length === 0 ? (
@@ -134,8 +207,8 @@ export function SessionList() {
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {filteredSessions.map((session) => (
-                  <TableRow key={session.id}>
+                {filteredSessions.map((session, index) => (
+                  <TableRow key={`${session.id}-${index}`}>
                     <TableCell>
                       <div className="flex items-center gap-1">
                         <Hash className="h-3 w-3 text-muted-foreground" />
@@ -200,8 +273,8 @@ export function SessionList() {
                       </TableRow>
                     </TableHeader>
                     <TableBody>
-                      {sessionChanges.map((change) => (
-                        <TableRow key={change.id}>
+                      {sessionChanges.map((change, index) => (
+                        <TableRow key={`${change.id}-${index}`}>
                           <TableCell>
                             <Badge className={
                               change.operation_type === "新增" ? "bg-green-500" : 

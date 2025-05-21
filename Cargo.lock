@@ -4422,7 +4422,6 @@ dependencies = [
  "dashmap 7.0.0-rc2",
  "derivative",
  "dynfmt",
- "flate2",
  "futures",
  "hash32",
  "hash32-derive",
