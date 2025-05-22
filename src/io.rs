@@ -927,6 +927,37 @@ impl PdmsIO {
             }
         }
 
+        // 5. 批量执行 SurrealQL 元素 upsert/merge/insert 语句
+        println!("\n5. 批量执行元素 SurrealQL...");
+        let mut surql_batch = Vec::new();
+        let mut total_surql = 0;
+        for (&_sesno, elements) in range_eles {
+            for element in elements {
+                let id = element.refno.to_string();
+                let surql = element.to_surql(&id);
+                if !surql.is_empty() {
+                    surql_batch.push(surql);
+                    total_surql += 1;
+                    if surql_batch.len() >= 100 {
+                        let batch_sql = surql_batch.join(";\n");
+                        if let Err(e) = SUL_DB.query(&batch_sql).await {
+                            println!("批量执行 SurrealQL 错误: {}", e);
+                        }
+                        surql_batch.clear();
+                    }
+                }
+            }
+        }
+        // 处理剩余未满100条的
+        if !surql_batch.is_empty() {
+            let batch_sql = surql_batch.join(";\n");
+            // println!("批量执行 SurrealQL: {}", batch_sql);
+            if let Err(e) = SUL_DB.query(&batch_sql).await {
+                println!("批量执行 SurrealQL 错误: {}", e);
+            }
+        }
+        println!("SurrealQL 执行完成，共 {} 条。", total_surql);
+
         let elapsed = start_time.elapsed();
         println!("保存到SurrealDB完成, 耗时: {:?}", elapsed);
 
