@@ -48,6 +48,8 @@ pub struct ModifiedElement {
     pub modified_uda_attrs: HashMap<i32, (NamedAttrValue, NamedAttrValue)>,
     /// 元素类型
     pub noun: String,
+    /// 子元素变更 (old_children, new_children)
+    pub children_changed: Option<(RefU64Vec, RefU64Vec)>,
 }
 
 impl ModifiedElement {
@@ -117,6 +119,25 @@ impl ModifiedElement {
             }));
         }
         
+        // 处理子元素变更
+        if let Some((old_children, new_children)) = &self.children_changed {
+            // 将children序列化为RefU64的数组格式
+            let old_children_json: Vec<String> = old_children.iter()
+                .map(|refno| refno.to_string())
+                .collect();
+            
+            let new_children_json: Vec<String> = new_children.iter()
+                .map(|refno| refno.to_string())
+                .collect();
+            
+            operations.push(serde_json::json!({
+                "op": "replace",
+                "path": "children",
+                "value": new_children_json,
+                "old": old_children_json
+            }));
+        }
+        
         // // 处理新增的UDA属性
         // for (key, attr) in &self.added_uda_attrs {
         //     operations.push(serde_json::json!({
@@ -161,6 +182,21 @@ impl ModifiedElement {
         let mut records_sql = String::new();
         
         //todo， 如果是Vec<RefU64>的，也需要处理一下
+        
+        // 处理子元素变更，使用新的子元素列表替换旧的
+        // if let Some((_, new_children)) = &self.children_changed {
+        //     if !new_children.is_empty() {
+        //         let children_array = serde_json::Value::Array(
+        //             new_children.iter()
+        //                 .map(|refno| serde_json::Value::String(format!("pe:{}", refno.to_pe_key())))
+        //                 .collect()
+        //         );
+        //         main_fields.insert("children".to_string(), children_array);
+        //     } else {
+        //         // 如果新的子元素列表为空，设置为空数组
+        //         main_fields.insert("children".to_string(), serde_json::Value::Array(vec![]));
+        //     }
+        // }
 
         // 处理新增的普通属性
         for (key, attr) in &self.added_attrs {
@@ -495,6 +531,42 @@ impl std::fmt::Debug for EleOperationDetail {
                     writeln!(f, "  几何体变化")?;
                 }
 
+                // 检查子元素变化
+                if let Some((old_children, new_children)) = &ele.children_changed {
+                    has_changes = true;
+                    writeln!(f, "  子元素变化:")?;
+                    writeln!(f, "    - 旧子元素数量: {}", old_children.len())?;
+                    writeln!(f, "    - 新子元素数量: {}", new_children.len())?;
+                    
+                    // 找出新增的子元素
+                    let added: Vec<_> = new_children.iter()
+                        .filter(|refno| !old_children.contains(refno))
+                        .collect();
+                    if !added.is_empty() {
+                        writeln!(f, "    - 新增子元素 ({}):", added.len())?;
+                        for refno in added.iter().take(5) {
+                            writeln!(f, "      * {:?}", refno)?;
+                        }
+                        if added.len() > 5 {
+                            writeln!(f, "      * ... 及其他 {} 个", added.len() - 5)?;
+                        }
+                    }
+                    
+                    // 找出删除的子元素
+                    let removed: Vec<_> = old_children.iter()
+                        .filter(|refno| !new_children.contains(refno))
+                        .collect();
+                    if !removed.is_empty() {
+                        writeln!(f, "    - 删除子元素 ({}):", removed.len())?;
+                        for refno in removed.iter().take(5) {
+                            writeln!(f, "      * {:?}", refno)?;
+                        }
+                        if removed.len() > 5 {
+                            writeln!(f, "      * ... 及其他 {} 个", removed.len() - 5)?;
+                        }
+                    }
+                }
+
                 // 普通属性变化
                 if !ele.added_attrs.is_empty() {
                     has_changes = true;
@@ -635,6 +707,233 @@ impl PdmsIO {
         Ok(data)
     }
 }
+
+
+///数据库相关的方法实现
+impl PdmsIO {
+
+    /// 将元素操作保存到SurrealDB数据库
+    ///
+    /// # 参数
+    /// * `io` - PDMS IO实例的引用
+    /// * `range_eles` - 会话号到元素列表的映射
+    ///
+    /// # 返回值
+    /// * `anyhow::Result<()>` - 成功返回Ok(())，失败返回错误
+    pub async fn update_elements_to_database(
+        &mut self,
+        range_eles: &HashMap<u32, Vec<EleOperationData>>,
+    ) -> anyhow::Result<()> {
+        println!("\n将元素操作保存到SurrealDB...");
+        let start_time = Instant::now();
+
+        // 创建会话信息表（如果不存在）
+        // let create_session_table_sql = r#"
+        // DEFINE TABLE sessions SCHEMAFULL;
+        // DEFINE FIELD sesno ON sessions TYPE int;
+        // DEFINE FIELD timestamp ON sessions TYPE datetime;
+        // DEFINE FIELD dbnum ON sessions TYPE int;
+        // DEFINE FIELD add_count ON sessions TYPE int;
+        // DEFINE FIELD modify_count ON sessions TYPE int;
+        // DEFINE FIELD delete_count ON sessions TYPE int;
+        // DEFINE FIELD computer_name ON sessions TYPE string;
+        // DEFINE FIELD comments ON sessions TYPE string;
+        // DEFINE FIELD end_pgno ON sessions TYPE int;
+        // DEFINE FIELD index_root_pageno ON sessions TYPE int;
+        // DEFINE FIELD claim_pageno ON sessions TYPE int;
+        // "#;
+        //
+        // // 忽略错误，表可能已经存在
+        // let _ = SUL_DB.query(create_session_table_sql).await;
+
+        // 从IO中读取所有会话数据并保存到数据库
+        let pdms_header = self.read_pdms_header()?;
+        let dbnum = pdms_header.db_num;
+        println!("\n1. 先创建所有会话记录...");
+
+        // 获取所有会话号
+        let all_sesnos: Vec<u32> = range_eles.keys().cloned().collect();
+        println!("找到 {} 个会话", all_sesnos.len());
+
+        // 使用批量插入来创建所有会话记录
+        let mut session_records = Vec::new();
+
+        for &sesno in &all_sesnos {
+            // 从io获取SessionPageData，包含完整会话信息
+            let ses_data = self.get_ses_data(sesno)?;
+
+            let session_record = format!(
+                r#"{{
+                id: "{}_{}",
+                sesno: {},
+                timestamp: d"{}",
+                dbnum: {},
+                add_count: 0,
+                modify_count: 0,
+                delete_count: 0,
+                computer_name: "{}",
+                comments: "{}",
+                end_pgno: {},
+                index_root_pageno: {},
+                claim_pageno: {}
+            }}"#,
+                dbnum,
+                sesno,
+                sesno,
+                ses_data.get_dt().to_rfc3339(),
+                dbnum,
+                ses_data.get_computer_name(),
+                ses_data.get_comments_name(),
+                ses_data.end_pgno,
+                ses_data.index_root_pageno,
+                ses_data.claim_pageno
+            );
+
+            session_records.push(session_record);
+        }
+
+        // 构建批量插入SQL并执行
+        println!("按每批100条记录执行批量插入...");
+
+        // 将记录分批处理，每批最多100条
+        for chunk in session_records.chunks(100) {
+            // 构建批量插入SQL
+            let batch_insert_sql = format!(
+                r#"
+            INSERT IGNORE INTO sessions [
+                {}
+            ];
+            "#,
+                chunk.join(",\n            ")
+            );
+
+            // 执行批量插入SQL
+            if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
+                eprintln!("批量保存会话信息错误: {}", e);
+            }
+        }
+
+        println!("所有会话数据创建完成");
+
+        // 统计每个会话的操作类型数量
+        println!("\n2. 统计每个会话的增删改数量...");
+        let mut session_stats: HashMap<i32, (i32, i32, i32)> = HashMap::new();
+
+        // 遍历所有会话和元素
+        for (sesno, elements) in range_eles {
+            for element in elements {
+                let stats = session_stats.entry(*sesno as i32).or_insert((0, 0, 0));
+                match &element.detail {
+                    EleOperationDetail::Add(_) => stats.0 += 1,
+                    EleOperationDetail::Modified { .. } => stats.1 += 1,
+                    EleOperationDetail::Deleted(_) => stats.2 += 1,
+                    EleOperationDetail::None => {}
+                }
+            }
+        }
+
+        // 更新会话的增删改数量
+        println!("\n3. 更新会话的增删改数量...");
+        for (sesno, stats) in &session_stats {
+            let update_session_sql = format!(
+                r#"
+            UPDATE sessions:{}_{}
+            SET
+                add_count = {},
+                modify_count = {},
+                delete_count = {}
+            ;
+            "#,
+                dbnum, sesno, stats.0, stats.1, stats.2
+            );
+
+            // 执行SQL
+            if let Err(e) = SUL_DB.query(&update_session_sql).await {
+                eprintln!("更新会话信息错误: {}", e);
+            }
+        }
+
+        println!("\n4. 保存元素变更记录...");
+
+        // 准备批量插入元素变更记录
+        let mut element_records = Vec::new();
+
+        // 遍历所有会话和元素
+        for (&sesno, elements) in range_eles {
+            let timestamp = self.get_ses_data(sesno)?.get_dt().to_rfc3339();
+            for element in elements {
+                let refno = element.refno;
+
+                // 记录变更历史
+                let op_type = element.get_op_type();
+                let entity_type = match &element.detail {
+                    EleOperationDetail::Add(ele_data) => ele_data.att_map().get_type(),
+                    EleOperationDetail::Modified(modified) => modified.noun.clone(),
+                    EleOperationDetail::Deleted(noun_type) => noun_type.clone(),
+                    EleOperationDetail::None => "unknown".to_string(),
+                };
+                if entity_type == "unknown" {
+                    continue;
+                }
+                let details = if let EleOperationDetail::Modified(modified) = &element.detail {
+                    modified.to_patch_json()
+                } else {
+                    "[]".to_string()
+                };
+
+                // 创建元素变更记录对象
+                let element_record = format!(
+                    r#"{{
+                        id: [{},{}],
+                        refno: {},
+                        operation_type: "{}",
+                        entity_type: "{}",
+                        timestamp: d"{}",
+                        session_id: sessions:{}_{},
+                        sesno: {},
+                        details: {}
+                    }}"#,
+                    refno.to_pe_key(),
+                    sesno,
+                    refno.to_pe_key(),
+                    op_type,
+                    entity_type,
+                    &timestamp,
+                    dbnum,
+                    sesno,
+                    sesno,
+                    details
+                );
+
+                element_records.push(element_record);
+            }
+        }
+
+        // 按每批100条记录执行批量插入
+        for chunk in element_records.chunks(100) {
+            if chunk.len() > 0 {
+                // 构建批量插入SQL
+                let batch_insert_sql = format!(
+                    r#"
+            INSERT IGNORE INTO element_changes [
+                {}
+            ];
+            "#,
+                    chunk.join(",\n                ")
+                );
+                if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
+                    println!("批量保存元素变更记录错误: {}", e);
+                }
+            }
+        }
+
+        let elapsed = start_time.elapsed();
+        println!("保存到SurrealDB完成, 耗时: {:?}", elapsed);
+
+        Ok(())
+    }
+}
+
 
 const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [
     0x00u8, 0x00, 0x00, 0x05, 0x00, 0xCC, 0x47, 0xDF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -897,6 +1196,7 @@ impl PdmsIO {
     ) -> anyhow::Result<HashMap<RefU64, EleOperationDetail>> {
         let mut result = HashMap::new();
 
+        // dbg!(refno);
         // 使用search_latest_and_prev_refno获取最新版本和前一个版本
         let [latest, previous] = self.search_latest_and_prev_refno(refno, sesno);
 
@@ -941,17 +1241,24 @@ impl PdmsIO {
         // };
 
         let owner = latest_att.owner;
+        // dbg!(&latest_att);
         //todo 直接调用 parse children 方法
+        let mut skipped = false;
         let owner_ele = match self.auto_get_raw_element(owner) {
             Ok(ele) => ele,
             Err(e) => {
                 log::warn!("获取所有者元素失败: {}", e);
-                result.insert(refno, EleOperationDetail::None);
-                return Ok(result);
+                if type_name == "SITE" {
+                    skipped = true;
+                    EleData::default()
+                } else {
+                    result.insert(refno, EleOperationDetail::None);
+                    return Ok(result);
+                }
             }
         };
 
-        if !owner_ele.children.contains(&refno) {
+        if !owner_ele.children.contains(&refno) && !skipped {
             result.insert(refno, EleOperationDetail::Deleted(type_name.clone()));
             return Ok(result);
         }
@@ -968,8 +1275,21 @@ impl PdmsIO {
         };
 
         // 检查子元素是否有变化
-        let prev_children = &latest_att.children;
-        let latest_children = &prev_att.children;
+        let latest_children = &latest_att.children;
+        let prev_children = &prev_att.children;
+        
+        // 检查children是否发生变化
+        let children_changed = {
+            // 将RefU64Vec转换为HashSet进行比较
+            let prev_set: HashSet<_> = prev_children.iter().collect();
+            let latest_set: HashSet<_> = latest_children.iter().collect();
+            
+            if prev_set != latest_set {
+                Some((prev_children.clone(), latest_children.clone()))
+            } else {
+                None
+            }
+        };
 
         // 检查子元素的增删改
         // 1. 找出已删除的子元素
@@ -985,7 +1305,7 @@ impl PdmsIO {
 
         //首先检查是否是属于有几何体的类型。
         //然后是检查发生修改的属性是什么
-        let mut is_changed = false;
+        let mut is_changed = children_changed.is_some();
 
         // 存储属性变化
         let mut added_attrs = HashMap::new();
@@ -995,10 +1315,6 @@ impl PdmsIO {
         // 检查普通属性的变化
         while let Some((noun, value)) = latest_att.att_map_mut().pop_first() {
             if let Some(prev_value) = prev_att.att_map_mut().remove(&noun) {
-                // if noun == "SPRE" && refno == "17496_171604".into() {
-                //     dbg!(&value);
-                //     dbg!(&prev_value);
-                // }
                 if value != prev_value {
                     is_changed = true;
                     modified_attrs.insert(noun, (prev_value.clone(), value));
@@ -1102,6 +1418,7 @@ impl PdmsIO {
                     deleted_uda_attrs,
                     modified_uda_attrs,
                     noun: type_name.clone(),
+                    children_changed,
                 }),
             );
         }

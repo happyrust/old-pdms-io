@@ -14,6 +14,9 @@ pub mod io_log;
 // 重新导出常用函数，使其可以直接从crate根访问
 pub use io::{PdmsIO, benchmark_increment_eles};
 
+// 重新导出日志配置功能
+pub use io_log::{init_log, init_log_with_file, init_log_advanced, LogConfig};
+
 
 
 
