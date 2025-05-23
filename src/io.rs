@@ -175,31 +175,21 @@ impl ModifiedElement {
     ///
     /// # 返回值
     /// 返回完整的SurrealQL UPSERT MERGE语句
-    pub fn to_surql(&self, id: &str) -> String {
+    pub fn to_modify_surql(&self, id: &str) -> String {
         let mut main_fields = serde_json::Map::new();
         let mut uda_attrs = serde_json::Map::new();
 
         let mut records_sql = String::new();
-        
-        //todo， 如果是Vec<RefU64>的，也需要处理一下
-        
-        // 处理子元素变更，使用新的子元素列表替换旧的
-        // if let Some((_, new_children)) = &self.children_changed {
-        //     if !new_children.is_empty() {
-        //         let children_array = serde_json::Value::Array(
-        //             new_children.iter()
-        //                 .map(|refno| serde_json::Value::String(format!("pe:{}", refno.to_pe_key())))
-        //                 .collect()
-        //         );
-        //         main_fields.insert("children".to_string(), children_array);
-        //     } else {
-        //         // 如果新的子元素列表为空，设置为空数组
-        //         main_fields.insert("children".to_string(), serde_json::Value::Array(vec![]));
-        //     }
-        // }
+        let mut pe_update_sql = String::new();
 
         // 处理新增的普通属性
         for (key, attr) in &self.added_attrs {
+            if key == "NAME" {
+                if let NamedAttrValue::StringType(name) = attr {
+                    // 如果是NAME属性，生成pe的更新语句
+                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}';\n", id, name);
+                }
+            }
             if let NamedAttrValue::RefU64Type(refno) = attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -209,6 +199,12 @@ impl ModifiedElement {
         
         // 处理修改的普通属性
         for (key, (_, new_attr)) in &self.modified_attrs {
+            if key == "NAME" {
+                if let NamedAttrValue::StringType(name) = new_attr {
+                    // 如果是NAME属性，生成pe的更新语句
+                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}';\n", id, name);
+                }
+            }
             if let NamedAttrValue::RefU64Type(refno) = new_attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -283,7 +279,7 @@ impl ModifiedElement {
         let id = format!("{}:{}", &self.noun, id);
         
         // 组合最终的SQL语句
-        if records_sql.is_empty() {
+        let mut sql = if records_sql.is_empty() {
             if fields_is_empty {
                 return String::new();
             }
@@ -294,7 +290,14 @@ impl ModifiedElement {
                 records_sql.push_str(&format!("{}, {}", records_sql, fields_json));
             }
             format!("UPSERT {} MERGE {{ {} }}", id, records_sql)
+        };
+
+        // 如果有pe更新语句，则合并返回
+        if !pe_update_sql.is_empty() {
+            sql = format!("{};\n{}", pe_update_sql, sql);
         }
+
+        sql
     }
     
     /// 获取所有属性名称
@@ -372,8 +375,8 @@ impl EleOperationData {
     }
     
     /// 将操作状态转换为SurrealQL语句
-    pub fn to_surql(&self, id: &str) -> String {
-        self.detail.to_surql(id)
+    pub fn to_surql(&self, id: &str, dbnum: i32, sesno: u32) -> String {
+        self.detail.to_surql(id, dbnum, sesno)
     }
 }
 
@@ -395,7 +398,7 @@ impl EleOperationDetail {
     ///
     /// # 返回值
     /// 返回完整的SurrealQL语句（CREATE/UPSERT/DELETE）
-    pub fn to_surql(&self, id: &str) -> String {
+    pub fn to_surql(&self, id: &str, dbnum: i32, sesno: u32) -> String {
         match self {
             // 新增元素：使用CREATE语句
             Self::Add(ele_data) => {
@@ -406,19 +409,27 @@ impl EleOperationDetail {
                     main_fields.insert(key.clone(), serde_json::to_value(value).unwrap_or(serde_json::Value::Null));
                 }
                 
+                // 生成pe数据的插入语句
+                let mut pe_data = ele_data.att_map().pe(dbnum); // 使用默认的 dbnum=0
+                pe_data.sesno = sesno as _;
+                let pe_json = pe_data.gen_sur_json(Some(ele_data.refno.to_pe_key()));
+                let pe_sql = format!("INSERT INTO pe [{}];", pe_json);
+                
                 // 构建CREATE语句
-                format!(
+                let create_sql = format!(
                     "CREATE {}:{} CONTENT {};",
                     ele_data.att_map().get_type(),
                     id,
-                    // serde_json::to_string(&main_fields).unwrap_or_else(|_| "{}".to_string())
                     ele_data.att_map().gen_sur_json().unwrap()
-                )
+                );
+                
+                // 合并两个SQL语句
+                format!("{};\n{}", pe_sql, create_sql)
             },
             
             // 修改元素：使用UPSERT MERGE语句
             Self::Modified(modified_element) => {
-                modified_element.to_surql(id)
+                modified_element.to_modify_surql(id)
             },
             
             // 删除元素：使用DELETE语句
@@ -931,10 +942,10 @@ impl PdmsIO {
         println!("\n5. 批量执行元素 SurrealQL...");
         let mut surql_batch = Vec::new();
         let mut total_surql = 0;
-        for (&_sesno, elements) in range_eles {
+        for (&sesno, elements) in range_eles {
             for element in elements {
                 let id = element.refno.to_string();
-                let surql = element.to_surql(&id);
+                let surql = element.to_surql(&id, dbnum, sesno);
                 if !surql.is_empty() {
                     surql_batch.push(surql);
                     total_surql += 1;
@@ -2171,9 +2182,6 @@ impl PdmsIO {
                     "INSERT RELATION INTO pe_owner [{}];",
                     pe_owner_h_relates.join(",")
                 );
-                // if is_debug{
-                //     println!("sql is : {}", &sql);
-                // }
                 SUL_DB.query(sql).await.unwrap();
                 pe_owner_h_relates.clear();
             }
