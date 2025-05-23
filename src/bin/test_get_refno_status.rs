@@ -109,11 +109,10 @@ async fn main() -> Result<()> {
                         modified_ele.modified_attrs.keys()
                     );
                 },
-                Some(EleOperationDetail::Deleted(noun_type)) => {
+                Some(EleOperationDetail::Deleted) => {
                     println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 已删除", 
                          refno, min_sesno, max_sesno);
                     println!("解释: 该参考号在此会话范围内被删除了");
-                    println!("元素类型: {}", noun_type);
                 },
                 Some(EleOperationDetail::None) => {
                     println!("参考号 {} 在会话范围 {} 到 {} 的操作状态为: 无操作", 

@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // println!("最新会话中共有 {} 个元素, 耗时: {:?}", latest_eles.len(), elapsed);
 
     // 测试用例2: 使用固定范围
-    let range_start = std::cmp::max(1, latest_sesno - 2);
+    let range_start = std::cmp::max(1, latest_sesno);
     let sesno_range = range_start..=latest_sesno;
 
     println!("\n测试2: 获取会话范围 {:?} 内的元素", sesno_range);

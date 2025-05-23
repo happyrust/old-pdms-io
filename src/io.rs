@@ -183,10 +183,7 @@ impl ModifiedElement {
         // 如果children发生变化,需要先删除现有的pe_owner关系,再重新插入新的children关系
         if let Some((_, new_children)) = &self.children_changed {
             // 删除现有的pe_owner关系
-            final_sql.push_str(&format!(
-                "DELETE pe:{}<-pe_owner;\n",
-                id
-            ));
+            final_sql.push_str(&format!("DELETE pe:{}<-pe_owner;\n", id));
 
             let mut json = Vec::new();
             // 插入新的children关系
@@ -203,7 +200,7 @@ impl ModifiedElement {
                 ));
             }
         }
-        dbg!(&final_sql);
+        // dbg!(&final_sql);
 
         // 处理新增的普通属性
         for (key, attr) in &self.added_attrs {
@@ -298,7 +295,11 @@ impl ModifiedElement {
         }
 
         // 构建完整的SurrealQL语句
-        if main_fields.is_empty() && records_sql.is_empty() && pe_update_sql.is_empty() && final_sql.is_empty(){
+        if main_fields.is_empty()
+            && records_sql.is_empty()
+            && pe_update_sql.is_empty()
+            && final_sql.is_empty()
+        {
             return String::new();
         }
 
@@ -308,12 +309,17 @@ impl ModifiedElement {
         let id = format!("{}:{}", &self.noun, id);
 
         // 组合最终的SQL语句
-        if records_sql.is_empty() {
-            final_sql.push_str(&format!("UPSERT {} MERGE {}", id, fields_json));
-        } else if !fields_is_empty {
-            // 添加逗号分隔符（如果需要）
-            final_sql.push_str(&format!("UPSERT {} MERGE {{ {}, {} }}", id, records_sql, fields_json));
-        };
+        if !records_sql.is_empty() || !fields_is_empty {
+            if records_sql.is_empty() {
+                final_sql.push_str(&format!("UPSERT {} MERGE {}", id, fields_json));
+            } else if !fields_is_empty {
+                // 添加逗号分隔符（如果需要）
+                final_sql.push_str(&format!(
+                    "UPSERT {} MERGE {{ {}, {} }}",
+                    id, records_sql, fields_json
+                ));
+            };
+        }
 
         // 如果有pe更新语句，则合并返回
         if !pe_update_sql.is_empty() {
@@ -351,7 +357,7 @@ pub enum EleOperationDetail {
     /// 新增元素，包含完整属性映射
     Add(EleData),
     /// 已删除的元素, 里面包含的是类型
-    Deleted(String),
+    Deleted,
     /// 已修改的元素，包含新增、删除和修改的属性
     Modified(ModifiedElement),
     /// 无操作
@@ -478,7 +484,7 @@ impl EleOperationDetail {
             Self::Modified(modified_element) => modified_element.to_modify_surql(id),
 
             // 删除元素：使用DELETE语句
-            Self::Deleted(noun_type) => {
+            Self::Deleted => {
                 format!("UPDATE pe:{} SET deleted = true, sesno = {}", id, sesno)
             }
 
@@ -492,7 +498,7 @@ impl EleOperationDetail {
         match self {
             Self::Add(_) => "新增",
             Self::Modified(_) => "修改",
-            Self::Deleted(_) => "删除",
+            Self::Deleted => "删除",
             Self::None => "无操作",
         }
     }
@@ -502,7 +508,7 @@ impl EleOperationDetail {
         match self {
             Self::Add(ele) => ele.att_map().get_type(),
             Self::Modified(ele) => ele.noun.clone(),
-            Self::Deleted(noun_type) => noun_type.clone(),
+            Self::Deleted => String::new(),
             Self::None => String::new(),
         }
     }
@@ -532,7 +538,7 @@ impl EleOperationDetail {
                     .att_names()
                     .iter()
                     .any(|name| PRIMITIVE_GEO_ATTR_NAMES.contains(&name.as_str())),
-                Self::Deleted(_) => true,
+                Self::Deleted => true,
                 Self::None => false,
             }
         } else if is_cata_geo_type || is_piping_type {
@@ -542,7 +548,7 @@ impl EleOperationDetail {
                     .att_names()
                     .iter()
                     .any(|name| CATA_GEO_ATTR_NAMES.contains(&name.as_str())),
-                Self::Deleted(_) => true,
+                Self::Deleted => true,
                 Self::None => false,
             }
         } else {
@@ -558,7 +564,7 @@ impl EleOperationDetail {
                 .att_names()
                 .iter()
                 .any(|name| TRANSFORM_ATTR_NAMES.contains(&name.as_str())),
-            Self::Deleted(_) => false,
+            Self::Deleted => false,
             Self::None => false,
         }
     }
@@ -580,8 +586,8 @@ impl std::fmt::Debug for EleOperationDetail {
                 }
                 Ok(())
             }
-            Self::Deleted(noun_type) => {
-                writeln!(f, "EleOperationDetail::Deleted({})", noun_type)?;
+            Self::Deleted => {
+                writeln!(f, "EleOperationDetail::Deleted")?;
                 if is_geometry_change {
                     writeln!(f, "  删除几何体")?;
                 }
@@ -890,7 +896,7 @@ impl PdmsIO {
                 match &element.detail {
                     EleOperationDetail::Add(_) => stats.0 += 1,
                     EleOperationDetail::Modified { .. } => stats.1 += 1,
-                    EleOperationDetail::Deleted(_) => stats.2 += 1,
+                    EleOperationDetail::Deleted => stats.2 += 1,
                     EleOperationDetail::None => {}
                 }
             }
@@ -936,15 +942,6 @@ impl PdmsIO {
 
                 // 记录变更历史
                 let op_type = element.get_op_type();
-                let entity_type = match &element.detail {
-                    EleOperationDetail::Add(ele_data) => ele_data.att_map().get_type(),
-                    EleOperationDetail::Modified(modified) => modified.noun.clone(),
-                    EleOperationDetail::Deleted(noun_type) => noun_type.clone(),
-                    EleOperationDetail::None => "unknown".to_string(),
-                };
-                if entity_type == "unknown" {
-                    continue;
-                }
                 let details = if let EleOperationDetail::Modified(modified) = &element.detail {
                     modified.to_patch_json()
                 } else {
@@ -952,22 +949,23 @@ impl PdmsIO {
                 };
 
                 // 创建元素变更记录对象
+                let pe_key = refno.to_pe_key();
                 let element_record = format!(
                     r#"{{
                         id: [{},{}],
                         refno: {},
                         operation_type: "{}",
-                        entity_type: "{}",
+                        entity_type: {}.noun,
                         timestamp: d"{}",
                         session_id: sessions:{}_{},
                         sesno: {},
                         details: {}
                     }}"#,
-                    refno.to_pe_key(),
+                    &pe_key,
                     sesno,
-                    refno.to_pe_key(),
+                    &pe_key,
                     op_type,
-                    entity_type,
+                    &pe_key,
                     &timestamp,
                     dbnum,
                     sesno,
@@ -976,24 +974,6 @@ impl PdmsIO {
                 );
 
                 element_records.push(element_record);
-            }
-        }
-
-        // 按每批100条记录执行批量插入
-        for chunk in element_records.chunks(100) {
-            if chunk.len() > 0 {
-                // 构建批量插入SQL
-                let batch_insert_sql = format!(
-                    r#"
-            INSERT IGNORE INTO element_changes [
-                {}
-            ];
-            "#,
-                    chunk.join(",\n                ")
-                );
-                if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
-                    println!("批量保存元素变更记录错误: {}", e);
-                }
             }
         }
 
@@ -1026,6 +1006,25 @@ impl PdmsIO {
                 println!("批量执行 SurrealQL 错误: {}", e);
             }
         }
+
+        // 按每批100条记录执行批量插入
+        for chunk in element_records.chunks(100) {
+            if chunk.len() > 0 {
+                // 构建批量插入SQL
+                let batch_insert_sql = format!(
+                    r#"
+            INSERT IGNORE INTO element_changes [
+                {}
+            ];
+            "#,
+                    chunk.join(",\n                ")
+                );
+                if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
+                    println!("批量保存元素变更记录错误: {}", e);
+                }
+            }
+        }
+
         println!("SurrealQL 执行完成，共 {} 条。", total_surql);
 
         let elapsed = start_time.elapsed();
@@ -1327,19 +1326,6 @@ impl PdmsIO {
             return Ok(result);
         }
 
-        // // 解包最新版本
-        // let (latest_sesno, latest_offset) = latest.unwrap();
-
-        // // 先判断是否发生删除
-        // let mut latest_att = match self.parse_raw_element(latest_offset) {
-        //     Ok(att) => att,
-        //     Err(e) => {
-        //         log::warn!("解析最新元素数据失败: {}", e);
-        //         result.insert(refno, EleOperationDetail::None);
-        //         return Ok(result);
-        //     }
-        // };
-
         let owner = latest_att.owner;
         // dbg!(&latest_att);
         //todo 直接调用 parse children 方法
@@ -1358,7 +1344,7 @@ impl PdmsIO {
             }
         };
         if !owner_ele.children.contains(&refno) && !skipped {
-            result.insert(refno, EleOperationDetail::Deleted(type_name.clone()));
+            result.insert(refno, EleOperationDetail::Deleted);
             return Ok(result);
         }
 
@@ -1395,10 +1381,7 @@ impl PdmsIO {
         for child_refno in prev_children.iter() {
             if !latest_children.contains(child_refno) {
                 //todo 有可能是扩展属性
-                result.insert(
-                    *child_refno,
-                    EleOperationDetail::Deleted(latest_att.att_map().get_type()),
-                );
+                result.insert(*child_refno, EleOperationDetail::Deleted);
             }
         }
 
