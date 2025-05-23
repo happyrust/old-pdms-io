@@ -7,7 +7,7 @@ use aios_core::{
 };
 use anyhow::{anyhow, Result};
 use atty::is;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local, Utc};
 use dashmap::{DashMap, DashSet};
 use futures_util::{FutureExt, StreamExt};
 use memchr::memmem::rfind_iter;
@@ -424,7 +424,7 @@ impl EleOperationDetail {
                 );
                 
                 // 合并两个SQL语句
-                format!("{};\n{}", pe_sql, create_sql)
+                format!("{}\n{}", pe_sql, create_sql)
             },
             
             // 修改元素：使用UPSERT MERGE语句
@@ -434,7 +434,7 @@ impl EleOperationDetail {
             
             // 删除元素：使用DELETE语句
             Self::Deleted(noun_type) => {
-                format!("UPDATE {}:{} SET deleted = true;", noun_type, id)
+                format!("UPDATE pe:{} SET deleted = true, sesno = {};", id, sesno)
             },
             
             // 无操作：返回空字符串
@@ -733,7 +733,7 @@ impl PdmsIO {
     /// * `anyhow::Result<()>` - 成功返回Ok(())，失败返回错误
     pub async fn update_elements_to_database(
         &mut self,
-        range_eles: &HashMap<u32, Vec<EleOperationData>>,
+        range_eles: &BTreeMap<u32, Vec<EleOperationData>>,
     ) -> anyhow::Result<()> {
         println!("\n将元素操作保存到SurrealDB...");
         let start_time = Instant::now();
@@ -791,7 +791,7 @@ impl PdmsIO {
                 dbnum,
                 sesno,
                 sesno,
-                ses_data.get_dt().to_rfc3339(),
+                ses_data.get_utc_dt().to_rfc3339(),
                 dbnum,
                 ses_data.get_computer_name(),
                 ses_data.get_comments_name(),
@@ -846,6 +846,9 @@ impl PdmsIO {
         // 更新会话的增删改数量
         println!("\n3. 更新会话的增删改数量...");
         for (sesno, stats) in &session_stats {
+            println!("会话 {}: 新增 {} 条, 修改 {} 条, 删除 {} 条", sesno, stats.0, stats.1, stats.2);
+        }
+        for (sesno, stats) in &session_stats {
             let update_session_sql = format!(
                 r#"
             UPDATE sessions:{}_{}
@@ -871,7 +874,7 @@ impl PdmsIO {
 
         // 遍历所有会话和元素
         for (&sesno, elements) in range_eles {
-            let timestamp = self.get_ses_data(sesno)?.get_dt().to_rfc3339();
+            let timestamp = self.get_ses_data(sesno)?.get_utc_dt().to_rfc3339();
             for element in elements {
                 let refno = element.refno;
 
@@ -1100,7 +1103,7 @@ impl PdmsIO {
     pub fn get_latest_dt(&mut self) -> anyhow::Result<DateTime<Utc>> {
         let header = self.read_pdms_header()?;
         let latest_ses_data = self.read_ses_data(header.latest_ses_pgno)?;
-        Ok(latest_ses_data.get_dt())
+        Ok(latest_ses_data.get_utc_dt())
     }
 
     // 收集指定参考号的历史记录
@@ -1256,7 +1259,7 @@ impl PdmsIO {
         let mut latest_att = match self.parse_raw_element(latest_offset) {
             Ok(att) => att,
             Err(e) => {
-                log::warn!("解析最新元素数据失败: {}", e);
+                log::warn!("解析最新元素数据失败: 位置{:#4X} {}", latest_offset, e);
                 result.insert(refno, EleOperationDetail::None);
                 return Ok(result);
             }
@@ -1299,7 +1302,6 @@ impl PdmsIO {
                 }
             }
         };
-
         if !owner_ele.children.contains(&refno) && !skipped {
             result.insert(refno, EleOperationDetail::Deleted(type_name.clone()));
             return Ok(result);
@@ -1497,6 +1499,14 @@ impl PdmsIO {
         [None, None]
     }
 
+    pub fn search_latest_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
+        let res = self.search_latest_refno_interal(refno, sesno, true).or(
+            self.search_latest_refno_interal(refno, sesno, false)
+        );
+
+        res
+    }
+
     /// 在数据库中搜索指定参考号的物理存储位置
     ///
     /// # 参数
@@ -1508,7 +1518,7 @@ impl PdmsIO {
     ///
     /// # 错误
     /// 当找不到指定参考号时返回错误
-    pub fn search_latest_refno(&mut self, refno: RefU64, sesno: Option<u32>) -> Option<(u32, u64)> {
+    fn search_latest_refno_interal(&mut self, refno: RefU64, sesno: Option<u32>, scan_cache: bool) -> Option<(u32, u64)> {
         // dbg!(sesno);
         // 根据sesno参数决定使用哪个会话的数据
         let latest_index_pgno = if let Some(target_sesno) = sesno {
@@ -1542,9 +1552,16 @@ impl PdmsIO {
                     .position(|x| x.refno_0 == r0 && x.refno_1 == r1)
             } else {
                 index_data.refno_locs.windows(2).position(|x| {
-                    let x0 = RefU64::from_two_nums(x[0].refno_0, x[0].refno_1);
-                    let x1 = RefU64::from_two_nums(x[1].refno_0, x[1].refno_1);
-                    (x1 > x0 && refno >= x0 && refno < x1) || (x1 < x0)
+                    //如果是开头的起始页，需要单独处理
+                    //应该是缓存页，优先去扫缓存的页面
+                    if x[0].is_start_page() {
+                        scan_cache
+                    } else {
+                        let x0 = RefU64::from_two_nums(x[0].refno_0, x[0].refno_1);
+                        let x1 = RefU64::from_two_nums(x[1].refno_0, x[1].refno_1);
+                        // dbg!((x0, x1));
+                        (x1 > x0 && refno >= x0 && refno < x1) || (x1 < x0)
+                    }
                 })
             };
 
@@ -1920,7 +1937,7 @@ impl PdmsIO {
             let all_locs = self.collect_refno_locs_in_session(cur_ses_pgno as _);
             let cur_ses_page = self.read_ses_data(cur_ses_pgno as _).unwrap().clone();
             let sesno = cur_ses_page.sesno;
-            let cur_dt = cur_ses_page.get_dt();
+            let cur_dt = cur_ses_page.get_utc_dt();
             let ses_id = cur_ses_page.get_id(dbnum);
             tx.send(SesSqlType::SesJson(vec![cur_ses_page.gen_sur_json(dbnum)]));
 
@@ -2806,13 +2823,12 @@ impl PdmsIO {
         let mut index_data = self.read_index_data(index_root_pageno).unwrap();
         // dbg!(index_data.level);
         let mut final_locs = vec![];
-        let mut level = index_data.level as i32;
+        // println!("index root pgno: {:#04X}", index_root_pageno * 0x800);
         self.filter_index_data(
             &index_data,
             &mut final_locs,
             last_end_pgno,
             cur_end_pgno,
-            &mut level,
         );
 
         final_locs
@@ -2853,40 +2869,44 @@ impl PdmsIO {
         result_locs: &mut Vec<RefnoDataLoc>,
         last_end_pgno: u32,
         cur_end_pgno: u32,
-        level: &mut i32,
+        // level: &mut i32,
     ) -> Option<bool> {
-        // let mut level = index_data?.level as i32;
+        let level = index_data.level as i32;
+        // dbg!(level);
         if index_data.refno_locs.is_empty() {
             return None;
         }
+        // dbg!(&index_data.refno_locs);
         let cur_locs = index_data
             .refno_locs
             .iter()
-            .filter(|x| x.pgno > last_end_pgno && x.pgno < cur_end_pgno && x.flag == 1)
+            .filter(|x|
+                x.pgno > last_end_pgno && x.pgno < cur_end_pgno && x.flag == 1
+            )
             .map(|x| x.clone())
             .collect::<Vec<_>>();
         if cur_locs.is_empty() {
             return None;
         }
-        // dbg!(*level);
-        if *level == 0 {
+        // dbg!(&cur_locs);
+        if level == 0 {
             // dbg!(&cur_locs[0]);
             result_locs.extend(cur_locs);
         } else {
             for l in cur_locs {
                 // dbg!(l.pgno);
+                // println!("hex offset: {:#04X}", l.pgno * 0x800);
                 if let Ok(next_index_data) = self.read_index_data(l.pgno) {
                     let mut next_level = next_index_data.level as i32;
-                    if next_level >= *level {
-                        // dbg!((next_level, *level));
-                        // dbg!((&l, next_index_data));
+                    if next_level >= level {
+                        dbg!((next_level, level));
+                        dbg!((&l, next_index_data));
                     } else {
                         self.filter_index_data(
                             &next_index_data,
                             result_locs,
                             last_end_pgno,
                             cur_end_pgno,
-                            &mut next_level,
                         );
                     }
                 }
@@ -2910,10 +2930,10 @@ impl PdmsIO {
     pub fn collect_increment_eles(
         &mut self,
         sesno_range: Option<RangeInclusive<i32>>,
-    ) -> anyhow::Result<HashMap<u32, Vec<EleOperationData>>> {
-        let mut processed_refnos = HashSet::new();
+    ) -> anyhow::Result<BTreeMap<u32, Vec<EleOperationData>>> {
+        // let mut processed_refnos = HashSet::new();
         // 按会话号分组结果
-        let mut grouped_results: HashMap<u32, Vec<EleOperationData>> = HashMap::new();
+        let mut grouped_results: BTreeMap<u32, Vec<EleOperationData>> = BTreeMap::new();
 
         //根据与实际的sesno_range 进行一个过滤
         let session_numbers = match &sesno_range {
@@ -2929,24 +2949,21 @@ impl PdmsIO {
         };
         dbg!(&session_numbers.len());
 
-        // 从高到低处理会话号
-        for &sesno in session_numbers.iter().rev() {
+        // 处理会话号
+        for &sesno in session_numbers.iter() {
             println!("collect sesno: {}", sesno);
             let final_locs = self.collect_refno_locs(sesno);
+            // dbg!(&final_locs);
             let mut operation_details_for_sesno = HashMap::new();
 
             for loc in final_locs {
                 let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
 
-                // 如果该参考号已经处理过，跳过
-                if processed_refnos.contains(&refno) {
-                    continue;
-                }
-                processed_refnos.insert(refno);
-
                 // 获取参考号的操作状态详情
                 let operation_details =
-                    self.get_refno_operation_status(refno, Some(sesno as u32))?;
+                    self.get_refno_operation_status(refno, Some(sesno as u32)).unwrap();
+                
+                // dbg!(&operation_details);
 
                 // 合并到当前会话的结果
                 operation_details_for_sesno.extend(operation_details);
@@ -3954,7 +3971,7 @@ impl PdmsIO {
                 } else {
                     // 比较与上一个版本（在历史中的下一个更老的版本）的差异
                     let previous = &history_elements[i + 1];
-                    Self::determine_operation(current, previous)
+                    EleOperation::Add
                 };
 
                 history_with_ops.push((current.clone(), operation));
@@ -4057,12 +4074,12 @@ impl PdmsIO {
     pub fn collect_recent_n_sessions_eles(
         &mut self,
         top_n: Option<u32>,
-    ) -> anyhow::Result<HashMap<u32, Vec<EleOperationData>>> {
+    ) -> anyhow::Result<BTreeMap<u32, Vec<EleOperationData>>> {
         let all_sesnos: Vec<i32> = self.sesno_pgno_map.keys().copied().collect();
 
         if all_sesnos.is_empty() {
             // 返回空的映射
-            return Ok(HashMap::new());
+            return Ok(Default::default());
         }
 
         let min_sesno = *all_sesnos.iter().min().unwrap();
@@ -4089,27 +4106,6 @@ impl PdmsIO {
         self.collect_increment_eles(Some(range))
     }
 
-    /// 根据两个版本的元素数据判断操作类型
-    fn determine_operation(current: &EleData, previous: &EleData) -> EleOperation {
-        // 比较状态
-        // let current_status = current.att_map().get_status();
-        // let previous_status = previous.att_map().get_status();
-
-        // // 如果状态从非0变为0，则认为是删除操作
-        // if current_status == 0 && previous_status != 0 {
-        //     return EleOperation::Deleted;
-        // }
-
-        // // 如果两个版本完全相同，则可能是重复记录
-        // if current.att_map().get_type() == previous.att_map().get_type() &&
-        //    current.name == previous.name &&
-        //    current.children == previous.children {
-        //     return EleOperation::Duplicate;
-        // }
-
-        // 默认为修改操作
-        EleOperation::Modified
-    }
 
     /// 在数据库中搜索指定参考号的物理存储位置（优化版本，使用二分查找）
     ///

@@ -1,6 +1,6 @@
 use aios_core::tool::db_tool::decode_chars_data;
 use aios_core::RefU64;
-use chrono::{DateTime, MappedLocalTime, TimeZone, Utc};
+use chrono::{DateTime, Local, MappedLocalTime, TimeZone, Utc};
 use deku::bitvec::*;
 use deku::ctx::Endian;
 use deku::prelude::*;
@@ -160,7 +160,7 @@ impl SessionPageData {
         let hours = self.hours % 24;
         let minutes = self.seconds / 60;
         let seconds = self.seconds % 60;
-        Utc.with_ymd_and_hms(
+        Local.with_ymd_and_hms(
             year as i32,
             month as u32,
             days,
@@ -168,8 +168,13 @@ impl SessionPageData {
             minutes,
             seconds,
         )
-        .latest()
         .unwrap()
+        .into()
+    }
+
+    #[inline] 
+    pub fn get_utc_dt(&self) -> DateTime<Utc> {
+        self.get_dt()
     }
 
     #[inline]
@@ -286,6 +291,13 @@ pub struct RefnoDataLoc {
 }
 
 impl RefnoDataLoc {
+
+    /// 是否是起始页
+    #[inline]
+    pub fn is_start_page(&self) -> bool {
+        self.refno_0 == 0x80000001 && self.refno_1 == 0x80000001
+    }
+
     /// 获取完整的参考号
     /// 
     /// 将高32位和低32位组合成完整的参考号
@@ -359,7 +371,7 @@ pub struct IndexPageData {
 
     /// 参考号位置信息列表
     /// 存储了参考号及其在数据库中的具体位置
-    #[deku(reader = "read_refno_data_loc(deku::rest, *level)")]
+    #[deku(reader = "read_refno_data_loc(deku::rest)")]
     pub refno_locs: Vec<RefnoDataLoc>,
 
     /// 页面剩余的填充字节
@@ -370,6 +382,24 @@ pub struct IndexPageData {
 }
 
 impl IndexPageData {
+
+    /// 获取起始页
+    /// 
+    /// 返回索引页中的起始页位置信息（如果存在）
+    /// 
+    /// # 返回值
+    /// * `Option<&RefnoDataLoc>` - 如果找到起始页则返回Some,否则返回None
+    #[inline] 
+    pub fn get_start_page(&self) -> Option<&RefnoDataLoc> {
+        self.refno_locs.first().filter(|first| first.is_start_page())
+    }
+
+    /// 获取最大页号
+    /// 
+    /// 遍历所有参考号位置信息,返回最大的页号值
+    /// 
+    /// # 返回值
+    /// * `u32` - 最大页号,如果列表为空则返回0
     #[inline]
     pub fn get_max_pgno(&self) -> u32 {
         self.refno_locs
@@ -380,27 +410,18 @@ impl IndexPageData {
     }
 }
 
-//如果 level 为 2，格式还有点不一样
 fn read_refno_data_loc(
     mut rest: &BitSlice<u8, Msb0>,
-    level: u32,
 ) -> Result<(&BitSlice<u8, Msb0>, Vec<RefnoDataLoc>), DekuError> {
     let mut vec = Vec::new();
-    if level == 2 {
-        //4 个未知数
-        //80 00 00 01 80 00 00 01 00 00 7D 3E 00 00 00 01
-        rest = u32::read(rest, ())?.0;
-        rest = u32::read(rest, ())?.0;
-        rest = u32::read(rest, ())?.0;
-        rest = u32::read(rest, ())?.0;
-    }
     loop {
         let (next_rest, peek) = u32::read(rest, ())?;
         if peek == 0x0 {
             rest = next_rest;
             break;
         }
-        let (next_rest, d) = RefnoDataLoc::read(rest, ())?;
+        let (next_rest, mut d) = RefnoDataLoc::read(rest, ())?;
+
         vec.push(d);
         rest = next_rest;
     }

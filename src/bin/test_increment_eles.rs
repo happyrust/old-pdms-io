@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 默认的数据库路径和参考号
     let db_path = std::env::args().nth(1).unwrap_or_else(|| {
-        r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams1112_0001"#.to_string()
+        r#"D:\AVEVA\Projects\E3D2.1\AvevaMarineSample\ams000\ams8000_0001"#.to_string()
     });
     let refno_str = std::env::args()
         .nth(2)
@@ -46,8 +46,8 @@ async fn main() -> anyhow::Result<()> {
     let mut io = PdmsIO::new(project_name.clone(), db_path, true);
     io.open()?;
 
-    let operation = io.get_refno_operation_status(refno_str.into(), None);
-    dbg!(&operation);
+    // let operation = io.get_refno_operation_status(refno_str.into(), None);
+    // dbg!(&operation);
     // return Ok(());
 
     // 获取最新会话号
@@ -55,17 +55,17 @@ async fn main() -> anyhow::Result<()> {
     println!("数据库最新会话号: {}", latest_sesno);
 
     // 测试用例1: 使用None获取最新会话
-    println!("\n测试1: 获取最新会话的元素");
-    let start_time = Instant::now();
-    let max_sesno = io.get_latest_att_pgno()? as i32;
-    dbg!(max_sesno);
+    // println!("\n测试1: 获取最新会话的元素");
+    // let start_time = Instant::now();
+    // let max_sesno = io.get_latest_att_pgno()? as i32;
+    // dbg!(max_sesno);
     // let latest_eles = io.collect_increment_eles(Some(0..=max_sesno)).unwrap();
     // let elapsed = start_time.elapsed();
 
     // println!("最新会话中共有 {} 个元素, 耗时: {:?}", latest_eles.len(), elapsed);
 
     // 测试用例2: 使用固定范围
-    let range_start = std::cmp::max(1, latest_sesno - 4);
+    let range_start = std::cmp::max(1, latest_sesno - 2);
     let sesno_range = range_start..=latest_sesno;
 
     println!("\n测试2: 获取会话范围 {:?} 内的元素", sesno_range);
