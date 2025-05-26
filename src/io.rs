@@ -3023,10 +3023,6 @@ impl PdmsIO {
     /// * 如果文件读取失败会返回错误
     ///
     /// # 示例
-    /// ```no_run
-    /// use pdms_io::PdmsIO;
-    /// let mut io = PdmsIO::new("test.pdms");
-    /// let exists = io.check_refno_exists(RefU64::new(1, 2))?;
     /// ```
     pub fn check_refno_exists(&mut self, refno: RefU64) -> anyhow::Result<bool> {
         let file = self.get_file()?;
@@ -3150,21 +3146,6 @@ impl PdmsIO {
     /// # 错误
     /// * 文件读取出错时返回错误
     ///
-    /// # 示例
-    /// ```no_run
-    /// use pdms_io::PdmsIO;
-    ///
-    /// let mut io = PdmsIO::new("project", "path/to/db", true);
-    /// io.open()?;
-    /// let index_map = io.build_index_map(false)?; // 不显示详细信息
-    /// // 现在可以快速查找refno及其历史记录
-    /// let refno = RefU64::from("12345/678");
-    /// if let Some(locs) = index_map.get(&refno) {
-    ///     println!("Found refno with {} history records", locs.len());
-    ///     // 获取最新版本
-    ///     let latest = &locs[0];
-    ///     println!("Latest version at pgno: {}, offset: {}", latest.pgno, latest.offset);
-    /// }
     /// ```
     pub fn build_index_map_verbose(
         &mut self,
