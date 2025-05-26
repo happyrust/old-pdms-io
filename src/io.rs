@@ -470,7 +470,7 @@ impl EleOperationDetail {
                     }
                     if !json.is_empty() {
                         relate_sql.push_str(&format!(
-                            "INSERT RELATION INTO pe_owner {{ {} }};\n",
+                            "INSERT RELATION INTO pe_owner [ {} ];\n",
                             json.join(", ")
                         ));
                     }
@@ -1001,7 +1001,7 @@ impl PdmsIO {
         // 处理剩余未满100条的
         if !surql_batch.is_empty() {
             let batch_sql = surql_batch.join(";\n");
-            println!("批量执行 SurrealQL: {}", batch_sql);
+            // println!("批量执行 SurrealQL: {}", batch_sql);
             if let Err(e) = SUL_DB.query(&batch_sql).await {
                 println!("批量执行 SurrealQL 错误: {}", e);
             }
@@ -1032,6 +1032,11 @@ impl PdmsIO {
 
         Ok(())
     }
+
+
+
+    
+
 }
 
 const REFNO_LEAF_INDEX_PAGE: [u8; 16] = [
@@ -2659,24 +2664,11 @@ impl PdmsIO {
         //     // //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, refno: {}, pgno:{}, offset:{}, op: {} }}",
         //     // //                                              ses_id, index, r, ses_id, refno.to_pe_key(), pgno, offset, op));
         //     // //                 }
-        //     // //                 //既不是新增，又不是删除，那就是修改
-        //     // //                 if !all_added.contains(&refno) && !all_deleted.contains(&refno) {
-        //     // //                     let op: i32 = DataOperation::Modified.into();
-        //     // //                     ses_relates.push(format!("{{ id:[e3d_ses:{}, {}], in: pe:{}, out: e3d_ses:{}, pgno:{}, offset:{}, op: {} }}",
-        //     // //                                              ses_id, index, refno, ses_id, pgno, offset, op));
+
+        //     // //                 if !all_added.is_empty() || !all_deleted.is_empty() {
+        //     // //                     println!("{sesno} Deleted: {:?}", &all_deleted);
+        //     // //                     println!("{sesno} Added: {:?}", &all_added);
         //     // //                 }
-        //     // //
-        //     // //                 //修改的需要去比对属性数据
-        //     // //
-        //     // //                 if !all_deleted.is_empty() || !all_added.is_empty() {
-        //     // //                     println!("{refno}_{pgno}: {:?}", prev_children);
-        //     // //                     println!("{refno}_{pgno}: {:?}", data.children);
-        //     // //                     println!("Deleted: {:?}", &all_deleted);
-        //     // //                     println!("Added: {:?}", &all_added);
-        //     // //                     //todo 需要将这个 relate 关系加回去，同时创建 pe，并设置为 delete
-        //     // //                     //todo 怎么查询这个构件是什么时候删除的呢，需要关联操作日志
-        //     // //                 }
-        //     // //                 prev_children = data.children.clone();
         //     // //             }
         //     // //             // if prev_children == data.children {
         //     // //             //     //新加的部分也要放在pe_relate里去
@@ -4250,6 +4242,360 @@ impl PdmsIO {
 
         // 根据窗口查找的逻辑，返回左侧索引对应的页面
         Some(locs[left].pgno)
+    }
+
+    /// 收集最新的元素数据，从后往前检索，只保留新增的元素
+    ///
+    /// 该方法通过从最新会话开始向前遍历，记录已处理的元素，
+    /// 只返回新增的元素，跳过已处理的元素（包括已删除和已修改的）。
+    ///
+    /// # 参数
+    /// * `max_sessions` - 可选的最大会话数量限制，如果为None则检索所有会话
+    ///
+    /// # 返回值
+    /// * `anyhow::Result<HashMap<RefU64, EleOperationData>>` - 返回新增的元素操作数据映射
+    ///
+    /// # 错误
+    /// * 当读取或解析元素数据失败时返回错误
+    pub fn collect_latest_eles(
+        &mut self,
+        max_sessions: Option<u32>,
+    ) -> anyhow::Result<HashMap<RefU64, EleOperationData>> {
+        let mut latest_elements: HashMap<RefU64, EleOperationData> = HashMap::new();
+        let mut deleted_refnos: HashSet<RefU64> = HashSet::new();
+        let mut processed_refnos: HashSet<RefU64> = HashSet::new();
+        
+        // 获取所有会话号，按降序排列（从最新到最旧）
+        let mut session_numbers: Vec<i32> = self.ses_range_map.keys().rev().cloned().collect();
+        
+        // 如果指定了最大会话数量，则限制处理的会话数
+        if let Some(max) = max_sessions {
+            session_numbers.truncate(max as usize);
+        }
+        
+        println!("开始从后往前检索最新元素数据，共处理 {} 个会话", session_numbers.len());
+        
+        // 从最新会话开始向前遍历
+        for (index, &sesno) in session_numbers.iter().enumerate() {
+            println!("处理会话 {} ({}/{})", sesno, index + 1, session_numbers.len());
+            
+            // 获取当前会话的所有元素操作
+            let locs = self.collect_refno_locs(sesno);
+            
+            // 先收集所有需要处理的元素
+            let mut current_session_operations = Vec::new();
+            
+            for loc in locs {
+                let refno = RefU64::from_two_nums(loc.refno_0, loc.refno_1);
+                
+                // 如果元素已经被处理过，则跳过
+                if processed_refnos.contains(&refno) {
+                    continue;
+                }
+                
+                // 解析元素操作
+                match self.get_refno_operation_status(refno, Some(sesno as u32)) {
+                    Ok(mut details) => {
+                        // 应该只有一个元素的操作状态
+                        if let Some((_, detail)) = details.drain().next() {
+                            match detail {
+                                EleOperationDetail::Deleted => {
+                                    current_session_operations.push((refno, detail, true));
+                                }
+                                EleOperationDetail::Add(_) => {
+                                    current_session_operations.push((refno, detail, false));
+                                }
+                                // 跳过修改操作
+                                EleOperationDetail::Modified(_) | EleOperationDetail::None => {}
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("处理元素 {:?} 时发生错误: {}", refno, e);
+                    }
+                }
+            }
+            
+            // 处理收集到的操作
+            for (refno, detail, is_delete) in current_session_operations {
+                processed_refnos.insert(refno);
+                
+                if is_delete {
+                    deleted_refnos.insert(refno);
+                    latest_elements.remove(&refno);
+                } else if !deleted_refnos.contains(&refno) && !latest_elements.contains_key(&refno) {
+                    latest_elements.insert(refno, EleOperationData::new(refno, sesno as u32, detail));
+                }
+            }
+        }
+
+        Ok(latest_elements)
+    }
+
+    /// 收集并保存最新元素数据和会话数据到数据库
+    ///
+    /// 这个方法结合了 collect_latest_eles 和 update_elements_to_database 的功能，
+    /// 用于收集最新的元素数据并将其保存到 SurrealDB 数据库中。
+    ///
+    /// # 参数
+    /// * `max_sessions` - 可选的最大会话数量限制，如果为None则处理所有会话
+    ///
+    /// # 返回值
+    /// * `anyhow::Result<()>` - 成功返回Ok(())，失败返回错误
+    ///
+    /// # 功能
+    /// 1. 收集最新的元素数据（只保留新增的元素，跳过已删除和修改的）
+    /// 2. 按会话组织数据
+    /// 3. 保存会话信息到数据库
+    /// 4. 保存元素数据到数据库
+    /// 5. 更新会话统计信息
+    pub async fn collect_and_save_latest_data(
+        &mut self,
+        max_sessions: Option<u32>,
+        eles_map: Option<HashMap<RefU64, EleOperationData>>,
+    ) -> anyhow::Result<()> {
+        println!("开始收集并保存最新元素数据和会话数据...");
+        let total_start_time = Instant::now();
+
+        // 第一步：收集最新元素数据
+        println!("\n1. 收集最新元素数据...");
+        let collect_start_time = Instant::now();
+        let latest_elements = if let Some(eles_map) = eles_map {
+            eles_map
+        } else {
+            self.collect_latest_eles(max_sessions)?
+        };
+        let collect_elapsed = collect_start_time.elapsed();
+        
+        println!("收集到 {} 个最新元素，耗时: {:?}", latest_elements.len(), collect_elapsed);
+
+        if latest_elements.is_empty() {
+            println!("没有找到新的元素数据，跳过保存步骤");
+            return Ok(());
+        }
+
+        // 第二步：按会话组织数据
+        println!("\n2. 按会话组织数据...");
+        let mut range_eles: BTreeMap<u32, Vec<EleOperationData>> = BTreeMap::new();
+        
+        for (_, element_data) in latest_elements {
+            let sesno = element_data.sesno;
+            range_eles.entry(sesno).or_insert_with(Vec::new).push(element_data);
+        }
+
+        println!("数据已按 {} 个会话组织", range_eles.len());
+        for (sesno, elements) in &range_eles {
+            println!("  会话 {}: {} 个元素", sesno, elements.len());
+        }
+
+        // 第三步：保存到数据库
+        println!("\n3. 保存数据到 SurrealDB...");
+        let save_start_time = Instant::now();
+        self.save_sessions_and_elements(&range_eles).await?;
+        let save_elapsed = save_start_time.elapsed();
+
+        let total_elapsed = total_start_time.elapsed();
+        println!("\n✅ 数据收集和保存完成!");
+        println!("  - 收集耗时: {:?}", collect_elapsed);
+        println!("  - 保存耗时: {:?}", save_elapsed);
+        println!("  - 总耗时: {:?}", total_elapsed);
+        println!("  - 处理会话数: {}", range_eles.len());
+        println!("  - 处理元素数: {}", range_eles.values().map(|v| v.len()).sum::<usize>());
+
+        Ok(())
+    }
+
+    /// 保存会话和元素数据到数据库
+    ///
+    /// 这是一个内部方法，用于将组织好的会话和元素数据保存到 SurrealDB
+    ///
+    /// # 参数
+    /// * `range_eles` - 按会话组织的元素数据
+    ///
+    /// # 返回值
+    /// * `anyhow::Result<()>` - 成功返回Ok(())，失败返回错误
+    async fn save_sessions_and_elements(
+        &mut self,
+        range_eles: &BTreeMap<u32, Vec<EleOperationData>>,
+    ) -> anyhow::Result<()> {
+        // 获取数据库信息
+        let pdms_header = self.read_pdms_header()?;
+        let dbnum = pdms_header.db_num;
+
+        // 第一步：创建会话记录
+        println!("  3.1 创建会话记录...");
+        let session_start_time = Instant::now();
+        
+        let all_sesnos: Vec<u32> = range_eles.keys().cloned().collect();
+        let mut session_records = Vec::new();
+
+        for &sesno in &all_sesnos {
+            // 获取会话详细信息
+            let ses_data = self.get_ses_data(sesno)?;
+
+            let session_record = format!(
+                r#"{{
+                    id: "{}_{}",
+                    sesno: {},
+                    timestamp: d"{}",
+                    dbnum: {},
+                    add_count: 0,
+                    modify_count: 0,
+                    delete_count: 0,
+                    computer_name: "{}",
+                    comments: "{}",
+                    end_pgno: {},
+                    index_root_pageno: {},
+                    claim_pageno: {}
+                }}"#,
+                dbnum,
+                sesno,
+                sesno,
+                ses_data.get_utc_dt().to_rfc3339(),
+                dbnum,
+                ses_data.get_computer_name(),
+                ses_data.get_comments_name(),
+                ses_data.end_pgno,
+                ses_data.index_root_pageno,
+                ses_data.claim_pageno
+            );
+
+            session_records.push(session_record);
+        }
+
+        // 批量插入会话记录
+        for chunk in session_records.chunks(50) {
+            let batch_insert_sql = format!(
+                r#"INSERT IGNORE INTO sessions [{}];"#,
+                chunk.join(",\n                ")
+            );
+
+            if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
+                eprintln!("批量保存会话信息错误: {}", e);
+            }
+        }
+
+        let session_elapsed = session_start_time.elapsed();
+        println!("    会话记录创建完成，耗时: {:?}", session_elapsed);
+
+        // 第二步：统计并更新会话的增删改数量
+        println!("  3.2 统计会话操作数量...");
+        let stats_start_time = Instant::now();
+        
+        let mut session_stats: HashMap<i32, (i32, i32, i32)> = HashMap::new();
+
+        for (sesno, elements) in range_eles {
+            for element in elements {
+                let stats = session_stats.entry(*sesno as i32).or_insert((0, 0, 0));
+                match &element.detail {
+                    EleOperationDetail::Add(_) => stats.0 += 1,
+                    EleOperationDetail::Modified(_) => stats.1 += 1,
+                    EleOperationDetail::Deleted => stats.2 += 1,
+                    EleOperationDetail::None => {}
+                }
+            }
+        }
+
+        // 更新会话统计
+        for (sesno, stats) in &session_stats {
+            println!("    会话 {}: 新增 {} 条, 修改 {} 条, 删除 {} 条", sesno, stats.0, stats.1, stats.2);
+            
+            let update_session_sql = format!(
+                r#"UPDATE sessions:{}_{}
+                SET add_count = {}, modify_count = {}, delete_count = {};"#,
+                dbnum, sesno, stats.0, stats.1, stats.2
+            );
+
+            if let Err(e) = SUL_DB.query(&update_session_sql).await {
+                eprintln!("更新会话统计错误: {}", e);
+            }
+        }
+
+        let stats_elapsed = stats_start_time.elapsed();
+        println!("    会话统计更新完成，耗时: {:?}", stats_elapsed);
+
+        // 第三步：保存元素数据
+        println!("  3.3 保存元素数据...");
+        let elements_start_time = Instant::now();
+
+        // 准备元素变更记录
+        let mut element_records = Vec::new();
+        let mut surql_batch = Vec::new();
+        let mut total_surql = 0;
+
+        for (&sesno, elements) in range_eles {
+            let timestamp = self.get_ses_data(sesno)?.get_utc_dt().to_rfc3339();
+            
+            for element in elements {
+                let refno = element.refno;
+                let op_type = element.get_op_type();
+                
+                // 只处理新增的元素（根据 collect_latest_eles 的逻辑）
+                if matches!(element.detail, EleOperationDetail::Add(_)) {
+                    // 创建元素变更记录
+                    let pe_key = refno.to_pe_key();
+                    let element_record = format!(
+                        r#"{{
+                            id: [{},{}],
+                            refno: {},
+                            operation_type: "{}",
+                            entity_type: {}.noun,
+                            timestamp: d"{}",
+                            session_id: sessions:{}_{},
+                            sesno: {},
+                            details: "[]"
+                        }}"#,
+                        &pe_key, sesno, &pe_key, op_type, &pe_key, &timestamp, dbnum, sesno, sesno
+                    );
+                    element_records.push(element_record);
+
+                    // 生成 SurrealQL
+                    let id = element.refno.to_string();
+                    let surql = element.to_surql(&id, dbnum, sesno);
+                    if !surql.is_empty() {
+                        surql_batch.push(surql);
+                        total_surql += 1;
+                        
+                        // 批量执行 SurrealQL（每50条）
+                        if surql_batch.len() >= 50 {
+                            let batch_sql = surql_batch.join(";\n");
+                            if let Err(e) = SUL_DB.query(&batch_sql).await {
+                                eprintln!("批量执行 SurrealQL 错误: {}", e);
+                            }
+                            surql_batch.clear();
+                        }
+                    }
+                }
+            }
+        }
+
+        // 处理剩余的 SurrealQL
+        if !surql_batch.is_empty() {
+            let batch_sql = surql_batch.join(";\n");
+            if let Err(e) = SUL_DB.query(&batch_sql).await {
+                eprintln!("批量执行 SurrealQL 错误: {}", e);
+            }
+        }
+
+        // 批量插入元素变更记录
+        for chunk in element_records.chunks(50) {
+            if !chunk.is_empty() {
+                let batch_insert_sql = format!(
+                    r#"INSERT IGNORE INTO element_changes [{}];"#,
+                    chunk.join(",\n                ")
+                );
+                if let Err(e) = SUL_DB.query(&batch_insert_sql).await {
+                    eprintln!("批量保存元素变更记录错误: {}", e);
+                }
+            }
+        }
+
+        let elements_elapsed = elements_start_time.elapsed();
+        println!("    元素数据保存完成，耗时: {:?}", elements_elapsed);
+        println!("    执行了 {} 条 SurrealQL 语句", total_surql);
+        println!("    保存了 {} 条元素变更记录", element_records.len());
+
+        Ok(())
     }
 }
 

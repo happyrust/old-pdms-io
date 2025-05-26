@@ -13,3 +13,5 @@ pub mod test_ses_data;
 pub mod test_history_data;
 
 pub mod test_refno_status;
+
+pub mod test_collect_latest_eles;
