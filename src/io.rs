@@ -171,12 +171,13 @@ impl ModifiedElement {
     ///
     /// # 返回值
     /// 返回完整的SurrealQL UPSERT MERGE语句
-    pub fn to_modify_surql(&self, id: &str) -> String {
+    pub fn to_modify_surql(&self, id: &str, sesno: u32) -> String {
         let mut main_fields = serde_json::Map::new();
         let mut uda_attrs = serde_json::Map::new();
 
         let mut records_sql = String::new();
-        let mut pe_update_sql = String::new();
+        // 默认更新 sesno
+        let mut pe_update_sql = format!("UPDATE pe:{} SET sesno = {}", id, sesno);
         let mut relate_sql = String::new();
         let mut final_sql = String::new();
 
@@ -204,12 +205,7 @@ impl ModifiedElement {
 
         // 处理新增的普通属性
         for (key, attr) in &self.added_attrs {
-            if key == "NAME" {
-                if let NamedAttrValue::StringType(name) = attr {
-                    // 如果是NAME属性，生成pe的更新语句
-                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}';\n", id, name);
-                }
-            }
+
             if let NamedAttrValue::RefU64Type(refno) = attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -219,12 +215,7 @@ impl ModifiedElement {
 
         // 处理修改的普通属性
         for (key, (_, new_attr)) in &self.modified_attrs {
-            if key == "NAME" {
-                if let NamedAttrValue::StringType(name) = new_attr {
-                    // 如果是NAME属性，生成pe的更新语句
-                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}';\n", id, name);
-                }
-            }
+
             if let NamedAttrValue::RefU64Type(refno) = new_attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -239,6 +230,12 @@ impl ModifiedElement {
 
         // 处理新增的显式属性
         for (key, attr) in &self.added_explicit_attrs {
+            if key == "NAME" {
+                if let NamedAttrValue::StringType(name) = attr {
+                    // 如果是NAME属性，生成pe的更新语句，同时更新name和sesno
+                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}', sesno = {}", id, name, sesno);
+                }
+            }
             if let NamedAttrValue::RefU64Type(refno) = attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -248,6 +245,12 @@ impl ModifiedElement {
 
         // 处理修改的显式属性
         for (key, (_, new_attr)) in &self.modified_explicit_attrs {
+            if key == "NAME" {
+                if let NamedAttrValue::StringType(name) = new_attr {
+                    // 如果是NAME属性，生成pe的更新语句，同时更新name和sesno
+                    pe_update_sql = format!("UPDATE pe:{} SET name = '{}', sesno = {}", id, name, sesno);
+                }
+            }
             if let NamedAttrValue::RefU64Type(refno) = new_attr {
                 records_sql.push_str(&format!("{key}: pe:{refno}"));
             } else {
@@ -321,9 +324,11 @@ impl ModifiedElement {
             };
         }
 
-        // 如果有pe更新语句，则合并返回
-        if !pe_update_sql.is_empty() {
+        // 总是包含pe更新语句（至少更新sesno）
+        if !final_sql.is_empty() {
             final_sql = format!("{};\n{}", final_sql, pe_update_sql);
+        } else {
+            final_sql = pe_update_sql;
         }
 
         final_sql
@@ -436,7 +441,8 @@ impl EleOperationDetail {
                 let mut main_fields = serde_json::Map::new();
 
                 // 添加所有属性
-                for (key, value) in ele_data.att_map().iter() {
+                let att_map = ele_data.whole_attmap.merge();
+                for (key, value) in att_map.iter() {
                     main_fields.insert(
                         key.clone(),
                         serde_json::to_value(value).unwrap_or(serde_json::Value::Null),
@@ -444,7 +450,7 @@ impl EleOperationDetail {
                 }
 
                 // 生成pe数据的插入语句
-                let mut pe_data = ele_data.att_map().pe(dbnum); // 使用默认的 dbnum=0
+                let mut pe_data = att_map.pe(dbnum); // 使用默认的 dbnum=0
                 pe_data.sesno = sesno as _;
                 let pe_json = pe_data.gen_sur_json(Some(ele_data.refno.to_pe_key()));
                 let pe_sql = format!("INSERT INTO pe [{}];", pe_json);
@@ -452,9 +458,9 @@ impl EleOperationDetail {
                 // 构建CREATE语句
                 let create_sql = format!(
                     "CREATE {}:{} CONTENT {};",
-                    ele_data.att_map().get_type(),
+                    att_map.get_type(),
                     id,
-                    ele_data.att_map().gen_sur_json().unwrap()
+                    att_map.gen_sur_json().unwrap()
                 );
 
                 let mut relate_sql = String::new();
@@ -481,7 +487,7 @@ impl EleOperationDetail {
             }
 
             // 修改元素：使用UPSERT MERGE语句
-            Self::Modified(modified_element) => modified_element.to_modify_surql(id),
+            Self::Modified(modified_element) => modified_element.to_modify_surql(id, sesno),
 
             // 删除元素：使用DELETE语句
             Self::Deleted => {
