@@ -170,6 +170,11 @@ impl CompressOptions {
         let output = output.as_ref().to_path_buf();
         let file_name = output.file_stem().unwrap().to_str().unwrap();
         let temp_file = format!("{temp_dir}/{}.tmp", file_name).into();
+        // OpenOptions for the temp chunk file requires the directory to exist.
+        let _ = create_dir_all(temp_dir);
+        if let Some(parent) = output.parent() {
+            let _ = create_dir_all(parent);
+        }
         dbg!(&temp_file);
         Self {
             force_create: true,
