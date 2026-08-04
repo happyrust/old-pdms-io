@@ -363,6 +363,70 @@ mod escape_surql_tests {
     }
 }
 
+/// F4 / T402：`Add` 的 `pe_owner` 关系写必须幂等。
+///
+/// 落库按 `TX_CHUNK` 分块提交，整窗口不是单事务。早块已提交、后块失败时按 ADR-001
+/// 会用同一 sesno 窗口重放；若 `Add` 仍是裸 `INSERT RELATION`，重放会撞上已存在的
+/// 复合 id `[pe:{id}, i]` 反复报错，把该 dbnum 的水位永久卡死。语句里先 `DELETE` 本
+/// 元素的入向 `pe_owner` 边，重放才收敛。
+#[cfg(test)]
+mod add_relate_idempotency_tests {
+    use super::{EleData, EleOperationDetail};
+    use aios_core::NamedAttrValue;
+    use aios_core::pdms_types::{RefU64, RefU64Vec};
+
+    /// 最小可渲染的 `Add` 载荷：`gen_sur_json_exclude` 会 `expect` 解析阶段注入的
+    /// DBNUM，`get_type` 没有 TYPE 时退化成 `unset`，两者都补上才能渲染出真语句。
+    fn add_with_children(children: &[u64]) -> EleOperationDetail {
+        let mut ele = EleData::default();
+        ele.whole_attmap.attmap.map.insert(
+            "TYPE".to_string(),
+            NamedAttrValue::StringType("BOX".to_string()),
+        );
+        ele.whole_attmap
+            .attmap
+            .map
+            .insert("DBNUM".to_string(), NamedAttrValue::IntegerType(7997));
+        ele.children = RefU64Vec(children.iter().copied().map(RefU64).collect());
+        EleOperationDetail::Add(ele)
+    }
+
+    #[test]
+    fn add_with_children_deletes_before_inserting_relations() {
+        let sql = add_with_children(&[2, 3]).to_surql("1_100", 7997, 42);
+
+        let delete_at = sql
+            .find("DELETE pe:1_100<-pe_owner")
+            .expect("Add 必须先删除本元素的入向 pe_owner 边");
+        let insert_at = sql
+            .find("INSERT RELATION INTO pe_owner")
+            .expect("Add 仍要写入 children 关系");
+        assert!(
+            delete_at < insert_at,
+            "DELETE 必须在 INSERT RELATION 之前，否则重放会撞已存在关系:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn rendering_twice_is_byte_identical() {
+        // 语句本身不含时间戳/随机量，重放同一窗口渲染出的 SQL 必须完全一致，
+        // 幂等性才只取决于「先删后插」这一条性质。
+        let first = add_with_children(&[2, 3]).to_surql("1_100", 7997, 42);
+        let second = add_with_children(&[2, 3]).to_surql("1_100", 7997, 42);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn add_without_children_emits_no_relation_statement() {
+        // 无 children 时不该发多余的 DELETE/INSERT，避免误删他处建立的关系。
+        let sql = add_with_children(&[]).to_surql("1_100", 7997, 42);
+        assert!(
+            !sql.contains("pe_owner"),
+            "无 children 的 Add 不应触碰 pe_owner:\n{sql}"
+        );
+    }
+}
+
 impl ModifiedElement {
     /// Attribute + one-based qualifier pairs for modified array values.
     pub fn qualified_attribute_changes(&self) -> Vec<(String, usize)> {
@@ -1121,6 +1185,12 @@ pub struct PdmsIO {
     pub sesno_pgno_map: BTreeMap<i32, u32>,
     /// 会话页面范围映射表,记录每个会话的起始页号和结束页号
     pub ses_range_map: BTreeMap<i32, Range<u32>>,
+    /// 索引页缓存。B+ 树下降会反复读同几个页（每个 refno 至少要下降两次：
+    /// latest 一次、prev 一次），而每次 `read_index_data` 都是 seek + 读一个 2 KB 页
+    /// + 新分配 Vec + 重新 Deku 解析。缓存后命中时只是引用计数加一。
+    ///
+    /// 文件在一个 `PdmsIO` 实例的生命周期内只读不写，所以不需要失效逻辑。
+    index_page_cache: HashMap<u32, Arc<IndexPageData>>,
 }
 
 impl PdmsIO {
@@ -1408,6 +1478,7 @@ impl PdmsIO {
             ses_data_map: Default::default(),
             sesno_pgno_map: Default::default(),
             ses_range_map: Default::default(),
+            index_page_cache: Default::default(),
         }
     }
 
@@ -1590,7 +1661,7 @@ impl PdmsIO {
             let pgno = (pos / 0x800) as _;
             println!("Found leaf index page at: {:#04X?}", pgno);
             let index_data = self.read_index_data(pgno)?;
-            dbg!(&index_data);
+            log::trace!("叶子索引页 {pgno:#04X?}: {index_data:?}");
             max_pgno = index_data
                 .refno_locs
                 .iter()
@@ -2971,19 +3042,24 @@ impl PdmsIO {
     /// * 解析索引页数据失败时返回错误
     ///
     /// # 实现细节
-    /// 1. 获取文件句柄
-    /// 2. 分配一个页大小的缓冲区
-    /// 3. 定位到指定页号的位置
-    /// 4. 读取整页数据
-    /// 5. 将数据解析为索引页结构
+    /// 1. 先查 [`Self::index_page_cache`]，命中直接返回（只加引用计数）
+    /// 2. 未命中才获取文件句柄、读整页、Deku 解析，并写回缓存
+    ///
+    /// 返回 `Arc` 而不是引用：调用方拿到结果后往往紧接着再调 `&mut self` 的方法
+    /// （如 `filter_index_data`），返回借用会直接撞借用检查。
     #[inline]
-    pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<IndexPageData> {
+    pub fn read_index_data(&mut self, index_pgno: u32) -> anyhow::Result<Arc<IndexPageData>> {
+        if let Some(cached) = self.index_page_cache.get(&index_pgno) {
+            return Ok(Arc::clone(cached));
+        }
         let file = self.get_file()?;
         let mut index_data = vec![];
         index_data.resize(PAGE_SIZE, 0u8);
         file.seek(SeekFrom::Start(index_pgno as u64 * PAGE_SIZE as u64))?;
         file.read_exact(&mut index_data)?;
-        let index_page_data = IndexPageData::try_from(index_data.as_ref())?;
+        let index_page_data = Arc::new(IndexPageData::try_from(index_data.as_ref())?);
+        self.index_page_cache
+            .insert(index_pgno, Arc::clone(&index_page_data));
         Ok(index_page_data)
     }
 
@@ -3102,7 +3178,8 @@ impl PdmsIO {
             //按 chunks 保存数据
             if pe_ses_sqls.len() > 100 {
                 if let Err(e) = tx.send(SesSqlType::PeSesSql(std::mem::take(&mut pe_ses_sqls))) {
-                    dbg!(&e);
+                    // 发送失败意味着这一批 SQL 被直接丢弃，不是可忽略的调试信息。
+                    log::error!("发送 PE 会话 SQL 批次失败，本批数据已丢弃: {e:?}");
                 }
             }
 
@@ -3113,7 +3190,7 @@ impl PdmsIO {
         }
         if pe_ses_sqls.len() > 0 {
             if let Err(e) = tx.send(SesSqlType::PeSesSql(pe_ses_sqls)) {
-                dbg!(&e);
+                log::error!("发送末批 PE 会话 SQL 失败，本批数据已丢弃: {e:?}");
             }
         }
         //关闭 channel
@@ -3997,8 +4074,11 @@ impl PdmsIO {
                 if let Ok(next_index_data) = self.read_index_data(l.pgno) {
                     let mut next_level = next_index_data.level as i32;
                     if next_level >= level {
-                        dbg!((next_level, level));
-                        dbg!((&l, next_index_data));
+                        // 层级没有下降，再递归下去就是死循环；跳过但必须留痕。
+                        log::warn!(
+                            "refno 索引层级异常 next_level={next_level} >= level={level}，\
+                             跳过子页 {l:?}：{next_index_data:?}"
+                        );
                     } else {
                         self.filter_index_data(
                             &next_index_data,
@@ -4047,7 +4127,7 @@ impl PdmsIO {
                 vec![latest_sesno]
             }
         };
-        dbg!(&session_numbers.len());
+        log::debug!("增量收集：会话号 {} 个", session_numbers.len());
 
         // 处理会话号
         for &sesno in session_numbers.iter() {
@@ -4307,9 +4387,6 @@ impl PdmsIO {
                     // 遍历子节点引用
                     for loc in &index_data.refno_locs {
                         if loc.pgno > 0 {
-                            if loc.pgno == 0x1564 {
-                                dbg!(&index_data.refno_locs);
-                            }
                             queue.push_back((loc.pgno, level + 1));
                         }
                     }
@@ -5197,7 +5274,7 @@ impl PdmsIO {
 
         let range = start_sesno..=max_sesno;
 
-        dbg!(&range);
+        log::debug!("增量收集会话范围: {range:?}");
 
         // 调用现有方法处理这个范围
         self.collect_increment_eles(Some(range))

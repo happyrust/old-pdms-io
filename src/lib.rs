@@ -1,11 +1,10 @@
-#[allow(warnings)]
-
-pub mod io;
-pub mod defines;
 pub mod common;
 pub mod config;
-pub mod test;
+pub mod defines;
+#[allow(warnings)]
+pub mod io;
 pub mod search;
+pub mod test;
 
 pub mod sync;
 
@@ -20,15 +19,9 @@ pub use io::{PdmsIO, benchmark_increment_eles};
 pub use config::{Config, ConfigInfo};
 
 // 重新导出日志配置功能
-pub use io_log::{init_log, init_log_with_file, init_log_advanced, LogConfig};
+pub use io_log::{LogConfig, init_log, init_log_advanced, init_log_with_file};
 
 #[cfg(test)]
 pub mod tests;
 
 pub mod surql;
-
-
-
-
-
-

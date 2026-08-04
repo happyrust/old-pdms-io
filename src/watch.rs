@@ -2,9 +2,9 @@ use crate::defines::{DbPageBasicInfo, PdmsHeader};
 use crate::io::PdmsIO;
 use dashmap::DashMap;
 use futures::{
-    channel::mpsc::{channel, Receiver},
-    future::ok,
     SinkExt, StreamExt,
+    channel::mpsc::{Receiver, channel},
+    future::ok,
 };
 use indexmap::IndexMap;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};

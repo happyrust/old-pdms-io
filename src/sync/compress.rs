@@ -1,6 +1,6 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use blake2::{Blake2b512, Digest};
-use futures_util::{future, StreamExt};
+use futures_util::{StreamExt, future};
 use log::*;
 use std::fs::create_dir_all;
 use std::io::Write;
@@ -12,8 +12,8 @@ use tokio::{
 };
 
 use crate::{human_size /*info_cmd*/};
-use dpcsync::{archive_reader::IoReader, chunk_dictionary as dict, HashSum};
-use dpcsync::{chunker, Compression};
+use dpcsync::{Compression, chunker};
+use dpcsync::{HashSum, archive_reader::IoReader, chunk_dictionary as dict};
 
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -30,8 +30,8 @@ async fn chunk_input<T>(
     u64,
     Vec<usize>,
 )>
-    where
-        T: AsyncRead + Unpin + Send,
+where
+    T: AsyncRead + Unpin + Send,
 {
     let mut source_hasher = Blake2b512::new();
     let mut unique_chunks = HashMap::new();
@@ -159,12 +159,11 @@ pub struct CompressOptions {
 impl CompressOptions {
     pub fn new<T: AsRef<Path>, U: AsRef<Path>>(input: T, output: U, temp_dir: &str) -> Self {
         let mut filter_config = chunker::FilterConfig::default();
-        let num_chunk_buffers: usize =
-            match num_cpus::get() {
-                // Single buffer if we have a single core, otherwise number of cores x 2
-                0 | 1 => 1,
-                n => n * 2,
-            };
+        let num_chunk_buffers: usize = match num_cpus::get() {
+            // Single buffer if we have a single core, otherwise number of cores x 2
+            0 | 1 => 1,
+            n => n * 2,
+        };
         filter_config.window_size = 8;
         // let temp_file = output.as_ref().with_extension("tmp");
         let output = output.as_ref().to_path_buf();
@@ -175,7 +174,7 @@ impl CompressOptions {
         if let Some(parent) = output.parent() {
             let _ = create_dir_all(parent);
         }
-        dbg!(&temp_file);
+        log::debug!("压缩临时分块文件: {temp_file:?}");
         Self {
             force_create: true,
             input: Some(input.as_ref().to_path_buf()),
@@ -205,8 +204,11 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
             opts.output.display()
         ))?;
 
-    let input_path = opts.input.as_ref()
-        .map(|x| x.display().to_string()).unwrap_or("stdin".to_owned());
+    let input_path = opts
+        .input
+        .as_ref()
+        .map(|x| x.display().to_string())
+        .unwrap_or("stdin".to_owned());
     let (source_hash, archive_chunks, source_size, chunk_order) =
         if let Some(input_path) = opts.input {
             chunk_input(
@@ -220,7 +222,7 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
                 opts.hash_length,
                 opts.num_chunk_buffers,
             )
-                .await?
+            .await?
         } else if !atty::is(atty::Stream::Stdin) {
             // Read source from stdin
             chunk_input(
@@ -231,7 +233,7 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
                 opts.hash_length,
                 opts.num_chunk_buffers,
             )
-                .await?
+            .await?
         } else {
             return Err(anyhow!("Missing input"));
         };
@@ -300,6 +302,10 @@ pub async fn execute_compress(opts: CompressOptions) -> Result<HashSum> {
         // let reader = IoReader::new(File::open(opts.output).await?);
         // info_cmd::print_archive_reader(reader).await?;
     }
-    println!("Archive created {} in {}", &input_path, time.elapsed().as_secs_f32());
+    println!(
+        "Archive created {} in {}",
+        &input_path,
+        time.elapsed().as_secs_f32()
+    );
     Ok(hash_sum)
 }
