@@ -64,7 +64,7 @@ dependencies = [
 [[package]]
 name = "aios_core"
 version = "0.2.0"
-source = "git+https://gitee.com/happydpc/rs-core#1fdcb49d41d6ff568a14527701f17d5b866d9189"
+source = "git+https://github.com/happyrust/rs-core.git?rev=7994051f2196b1b31d01678335783d06cab54142#7994051f2196b1b31d01678335783d06cab54142"
 dependencies = [
  "anyhow",
  "approx 0.5.1",
@@ -4380,7 +4380,7 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
-source = "git+https://gitee.com/happydpc/aios-parse-pdms#cca8779c02aef8f1e7363485aa522f6270d5fca7"
+source = "git+https://github.com/happyrust/aios-parse-pdms.git?rev=65caaef2a73161cf78371355bea26fd3a0d40c41#65caaef2a73161cf78371355bea26fd3a0d40c41"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -4415,7 +4415,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "smol_str 0.3.2",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
