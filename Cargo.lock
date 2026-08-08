@@ -3113,7 +3113,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tokio",
  "tower-service",
  "tracing",
@@ -4380,7 +4380,7 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
-source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=aa098bafc8543f699f9a2499fdd9841f1d20bd2b#aa098bafc8543f699f9a2499fdd9841f1d20bd2b"
+source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=03c1cdb35b24aa24e83ec8d072885cdc32d38ae3#03c1cdb35b24aa24e83ec8d072885cdc32d38ae3"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -4416,7 +4416,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "smol_str 0.3.2",
- "thiserror 1.0.69",
+ "thiserror 2.0.17",
  "tokio",
 ]
 
@@ -4502,7 +4502,7 @@ dependencies = [
 [[package]]
 name = "pdmsdb_engine_v2"
 version = "0.1.0"
-source = "git+https://github.com/happyrust/pdms-io.git?rev=7262dc3630df12ed0731f62fc157bca7416e3585#7262dc3630df12ed0731f62fc157bca7416e3585"
+source = "git+https://github.com/happyrust/pdms-io.git?rev=13a17e1f3a8ed8d18c1dcecdf10642c28654d4bb#13a17e1f3a8ed8d18c1dcecdf10642c28654d4bb"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4972,7 +4972,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls 0.23.33",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "thiserror 2.0.17",
  "tokio",
  "tracing",
@@ -5009,7 +5009,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2 0.6.1",
+ "socket2 0.5.10",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -5493,7 +5493,7 @@ dependencies = [
 [[package]]
 name = "rust-ploop-processor"
 version = "0.1.0"
-source = "git+https://gitee.com/happydpc/rust-ploop-processor#459dcf980be2bd6de8bd601414e5dc351ee808fd"
+source = "git+https://gitee.com/happydpc/rust-ploop-processor#36da2856c1b8853b4e3204fe41b985840f6d0884"
 dependencies = [
  "anyhow",
  "chrono",
