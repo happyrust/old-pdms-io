@@ -4380,7 +4380,7 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
-source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=cc4cbca76f4691254ad9f26b4119d264ef871fe4#cc4cbca76f4691254ad9f26b4119d264ef871fe4"
+source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=aa098bafc8543f699f9a2499fdd9841f1d20bd2b#aa098bafc8543f699f9a2499fdd9841f1d20bd2b"
 dependencies = [
  "aios_core",
  "anyhow",
