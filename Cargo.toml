@@ -15,7 +15,7 @@ anyhow = "1.0"
 deku = "0.16.0"
 memchr = "2.7.2"
 aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "777e238b", default-features = false }
-parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "d703f4a" }
+parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "cc4cbca76f4691254ad9f26b4119d264ef871fe4" }
 nom = "7.1.3"
 notify = "8.0.0"
 futures = "0.3.28"
