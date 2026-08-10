@@ -1191,6 +1191,10 @@ pub struct PdmsIO {
     ///
     /// 文件在一个 `PdmsIO` 实例的生命周期内只读不写，所以不需要失效逻辑。
     index_page_cache: HashMap<u32, Arc<IndexPageData>>,
+    /// Historical raw-element snapshots used while classifying a multi-session
+    /// window.  Owner membership must be read at the requested session boundary,
+    /// never from the file's final index.
+    historical_raw_cache: HashMap<(u32, RefU64), EleData>,
 }
 
 impl PdmsIO {
@@ -1479,6 +1483,7 @@ impl PdmsIO {
             sesno_pgno_map: Default::default(),
             ses_range_map: Default::default(),
             index_page_cache: Default::default(),
+            historical_raw_cache: Default::default(),
         }
     }
 
@@ -1785,7 +1790,11 @@ impl PdmsIO {
         // dbg!(&latest_att);
         //todo 直接调用 parse children 方法
         let mut skipped = false;
-        let owner_ele = match self.auto_get_raw_element(owner) {
+        let owner_result = match sesno {
+            Some(target_sesno) => self.raw_element_at_or_before(owner, target_sesno),
+            None => self.auto_get_raw_element(owner),
+        };
+        let owner_ele = match owner_result {
             Ok(ele) => ele,
             Err(e) => {
                 log::warn!("获取所有者元素失败: {}", e);
@@ -2865,6 +2874,32 @@ impl PdmsIO {
             .search_latest_refno(refno, None)
             .ok_or(anyhow!("找不到指定参考号: {:?}", refno))?;
         let ele_data = self.parse_raw_element(offset)?;
+        Ok(ele_data)
+    }
+
+    /// Read the element state visible at `sesno` (the latest version at or
+    /// before that session).  Increment classification uses this for OWNER
+    /// membership so a later parent deletion cannot rewrite an earlier
+    /// session's result.
+    fn raw_element_at_or_before(
+        &mut self,
+        refno: RefU64,
+        sesno: u32,
+    ) -> anyhow::Result<EleData> {
+        if let Some(cached) = self.historical_raw_cache.get(&(sesno, refno)) {
+            return Ok(cached.clone());
+        }
+
+        let (_, offset) = self
+            .search_latest_refno(refno, Some(sesno))
+            .ok_or(anyhow!(
+                "找不到会话 {} 或之前的参考号: {:?}",
+                sesno,
+                refno
+            ))?;
+        let ele_data = self.parse_raw_element(offset)?;
+        self.historical_raw_cache
+            .insert((sesno, refno), ele_data.clone());
         Ok(ele_data)
     }
 
