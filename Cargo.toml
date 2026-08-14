@@ -14,8 +14,8 @@ debug_btree_search = [] # 启用B+树搜索调试输出
 anyhow = "1.0"
 deku = "0.16.0"
 memchr = "2.7.2"
-aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "20990200", default-features = false }
-parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "96ec0d69c0dc365f64be5424a734bb79053080dc" }
+aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "265d98e5", default-features = false }
+parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "1e67cacbcc0963ae31da5c4820baf959de6e1145" }
 nom = "7.1.3"
 notify = "8.0.0"
 futures = "0.3.28"
