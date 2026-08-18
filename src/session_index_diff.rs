@@ -508,6 +508,28 @@ fn resolve_window_anchors(
     Ok((base_sesno, target_sesno))
 }
 
+/// 追加模型的门（纯函数）：目标索引根必然是 base 会话末页**之后**的新页。
+///
+/// 边界与 [`diff_roots`] 的共享判据互补，两者必须一起读：`child <= base_end_pgno`
+/// 算共享子树，所以目标根**恰好等于** `base_end_pgno` 也要拒——那说明它是 base
+/// 时刻就已写完的页，一棵本窗口没新写过的树当不了目标树。放它过去，共享判据会把
+/// 目标树自己的分支当成 base 的存量整枝剪掉，差分就成了一个悄悄错的答案。
+///
+/// 不满足通常意味着文件被压缩 / 回卷过（页号不再单调），此时页号边界这个判据整体
+/// 失效——宁可拒绝差分，也不给一个看着像真的结果。
+fn ensure_target_root_is_new(
+    base_root: u32,
+    base_end_pgno: u32,
+    target_root: u32,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        target_root > base_end_pgno,
+        "目标索引根页 {target_root} 不高于 base 会话末页 {base_end_pgno}\
+         （base 根 {base_root}），文件形态超出追加模型，拒绝差分"
+    );
+    Ok(())
+}
+
 /// 对一个已打开（或可打开）的库文件做窗口净差分。
 ///
 /// `with_noun` 为真时对三类条目按记录位置解析记录头补类型名（Deleted 解析的是
@@ -548,13 +570,7 @@ pub fn collect_net_changes(
         return Ok(set);
     }
     if let Some(base_root) = base_root {
-        // 追加模型下目标根必然是新页。不满足说明文件被压缩/回卷过，差分的
-        // 共享判据（页号边界）不再成立，宁可拒绝也不给一个悄悄错的答案。
-        anyhow::ensure!(
-            target_root > base_end_pgno,
-            "目标索引根页 {target_root} 不高于 base 会话末页 {base_end_pgno}\
-             （base 根 {base_root}），文件形态超出追加模型，拒绝差分"
-        );
+        ensure_target_root_is_new(base_root, base_end_pgno, target_root)?;
     }
 
     let raw = diff_roots(io, base_root, base_end_pgno, target_root)?;
@@ -1117,6 +1133,58 @@ mod tests {
         );
         assert!(resolve_window_anchors(&map, 0, 5).is_err());
         assert!(resolve_window_anchors(&map, 7, 6).is_err());
+    }
+
+    /// 追加模型的门：目标根必须**严格高于** base 会话末页。
+    ///
+    /// 恰好等于是最容易被写松的那一档，而它和共享判据是同一条边界的两面——
+    /// `diff_roots` 把 `child <= base_end_pgno` 判为共享，所以坐在边界上的根页
+    /// 属于 base 存量；当成目标根放行，等于让共享判据把目标树自己的分支剪掉。
+    /// 两边任一改成非严格，本用例与
+    /// `a_child_page_exactly_at_the_base_end_is_still_shared` 各红一条。
+    #[test]
+    fn an_append_only_target_root_must_sit_above_the_base_end_page() {
+        ensure_target_root_is_new(8, 10, 11).expect("base 末页之上的新根是正常形态");
+
+        let at_boundary = ensure_target_root_is_new(8, 10, 10)
+            .err()
+            .expect("目标根恰好压在 base 末页上必须拒绝");
+        let text = format!("{at_boundary:#}");
+        assert!(
+            text.contains("10") && text.contains("拒绝差分"),
+            "拒绝理由要报出两端页号: {text}"
+        );
+
+        assert!(
+            ensure_target_root_is_new(8, 10, 9).is_err(),
+            "目标根低于 base 末页说明文件被压缩/回卷，页号边界判据整体失效"
+        );
+    }
+
+    /// 时序约束，纯函数钉不住：**两端同一棵树的零差分短路必须排在追加模型门之前**。
+    ///
+    /// 窗口内没动过索引时 `base_root == target_root`，而这个根本来就 ≤ base 末页；
+    /// 门要是排在前面，最常见的「本窗口什么都没发生」会被判成文件形态异常而整窗失败。
+    #[test]
+    fn the_identical_root_shortcut_comes_before_the_append_model_gate() {
+        let source = include_str!("session_index_diff.rs");
+        let body = source
+            .split_once("pub fn collect_net_changes(")
+            .expect("collect_net_changes")
+            .1
+            .split_once("fn session_anchor(")
+            .expect("session_anchor follows")
+            .0;
+        let shortcut_at = body
+            .find("if base_root == Some(target_root) {")
+            .expect("零差分短路必须存在");
+        let gate_at = body
+            .find("ensure_target_root_is_new(")
+            .expect("追加模型门必须存在");
+        assert!(
+            shortcut_at < gate_at,
+            "顺序必须是 同根短路 → 追加模型门，否则「窗口内没动索引」会被判成文件异常"
+        );
     }
 
     // 跨结构对拍（点查仲裁 + 逐会话回放参照臂）留在 aios-database：它的参照臂是
