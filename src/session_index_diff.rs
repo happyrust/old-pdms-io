@@ -802,6 +802,61 @@ mod tests {
         // 右叶里原样拷贝的邻居（100_9）两边位置相同 → 未动，不出现在任何一类。
     }
 
+    /// 共享判据的边界：页号**恰等于** base 会话末页的子树也是共享的——`end_pgno`
+    /// 是 base 时刻已经写完的那一页，不是它之后的第一页。
+    ///
+    /// 回归背景（2026-08-19 变异抽检的唯一存活变异）：把 `child <= base_end_pgno`
+    /// 收紧成 `<`，上面那条共享子树用例照样全绿——它的共享叶停在 6，够不着边界。
+    /// 收紧后结果仍然正确（两侧都走一遍同一棵子树，条目位置相同判未动），坏掉的是
+    /// 「两侧 IO 正比于变更量」这个**整套算法的立身之本**，以及随回执透出的
+    /// `目标侧读页` / 剪枝计数——正确答案配错账，属于静默失效。
+    #[test]
+    fn a_child_page_exactly_at_the_base_end_is_still_shared() {
+        // base（root=8，末页 10）：内页 8 → 哨兵→**10**（左叶，页号压在边界上），
+        // 键(100,8)→7（右叶）。target（root=20）：哨兵→**10**（同一左叶），
+        // 键(100,8)→21（重写的右叶）。
+        let boundary_leaf = page(0, vec![loc(100, 1, 2, 0, 1), loc(100, 2, 2, 2, 1)]);
+        let base_right = page(0, vec![loc(100, 8, 3, 0, 1)]);
+        let target_right = page(0, vec![loc(100, 8, 13, 0, 1)]);
+        let mut pages = MemPages::new(vec![
+            (10, boundary_leaf),
+            (7, base_right),
+            (
+                8,
+                page(
+                    1,
+                    vec![loc(SENTINEL, SENTINEL, 10, 0, 1), loc(100, 8, 7, 0, 1)],
+                ),
+            ),
+            (21, target_right),
+            (
+                20,
+                page(
+                    1,
+                    vec![loc(SENTINEL, SENTINEL, 10, 0, 1), loc(100, 8, 21, 0, 1)],
+                ),
+            ),
+        ]);
+
+        let diff = diff_roots(&mut pages, Some(8), 10, 20).expect("diff");
+
+        assert!(
+            !pages.reads.contains(&10),
+            "页号 == base 末页的子树必须两侧整枝跳过，一页都不许读: {:?}",
+            pages.reads
+        );
+        assert_eq!(
+            diff.stats.shared_subtree_prunes, 1,
+            "边界上的子树要计入剪枝，否则回执里的读页账目与实际不符"
+        );
+        assert_eq!(
+            refnos3(&diff.modified),
+            vec![r(8)],
+            "剪枝不改变判定：只有右叶里换了位置的条目"
+        );
+        assert!(diff.added.is_empty() && diff.deleted.is_empty());
+    }
+
     /// 非叶层哨兵是最左子树指针必须跟进；叶层哨兵不是数据，跳过并计数。
     #[test]
     fn internal_sentinel_is_followed_and_leaf_sentinel_is_skipped() {
