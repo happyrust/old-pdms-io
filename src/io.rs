@@ -1960,6 +1960,7 @@ impl PdmsIO {
     /// # 用法区别
     /// - 如果只需要获取主参考号的状态，请使用`get_refno_primary_operation_status`
     /// - 如果需要同时获取子元素的状态变化，请使用本函数
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub fn get_refno_operation_status(
         &mut self,
         refno: RefU64,
@@ -4127,6 +4128,7 @@ impl PdmsIO {
     }
 
     ///收集一个会话里面的所有的属性数据
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub async fn collect_eles_in_session(&mut self, ses_pgno: u32) -> Vec<EleData> {
         let final_locs = self.collect_refno_locs_in_session(ses_pgno);
         let mut eles = vec![];
@@ -4220,6 +4222,7 @@ impl PdmsIO {
     ///
     /// # 错误
     /// * 当读取或解析元素数据失败时返回错误
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub fn collect_increment_eles(
         &mut self,
         sesno_range: Option<RangeInclusive<i32>>,
@@ -4895,6 +4898,7 @@ impl PdmsIO {
     ///
     /// # 返回值
     /// * `anyhow::Result<HashMap<RefU64, EleOperationDetail>>` - 元素参考号到元素数据的映射表
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub async fn collect_increment_eles_optimized(
         &mut self,
         sesno_range: RangeInclusive<i32>,
@@ -5286,6 +5290,7 @@ impl PdmsIO {
     ///
     /// # 错误
     /// * 当参考号在指定范围内不存在时返回错误
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub fn get_refno_primary_operation_status(
         &mut self,
         refno: RefU64,
@@ -5360,6 +5365,7 @@ impl PdmsIO {
     ///
     /// # 错误
     /// * 当读取或解析元素数据失败时返回错误
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub fn collect_recent_n_sessions_eles(
         &mut self,
         top_n: Option<u32>,
@@ -5514,6 +5520,7 @@ impl PdmsIO {
     ///
     /// # 错误
     /// * 当读取或解析元素数据失败时返回错误
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub async fn collect_latest_eles(
         &mut self,
         max_sessions: Option<u32>,
@@ -5619,6 +5626,7 @@ impl PdmsIO {
     /// 3. 保存会话信息到数据库
     /// 4. 保存元素数据到数据库
     /// 5. 更新会话统计信息
+    #[cfg(any(test, feature = "legacy_session_replay"))]
     pub async fn collect_and_save_latest_data(
         &mut self,
         max_sessions: Option<u32>,
@@ -6293,6 +6301,7 @@ pub fn extract_test_refnos(io: &mut PdmsIO, count: usize) -> anyhow::Result<Vec<
 ///
 /// # 错误
 /// * 如果打开数据库或执行查询失败，返回错误
+#[cfg(any(test, feature = "legacy_session_replay"))]
 pub async fn benchmark_increment_eles(path: &str) -> anyhow::Result<()> {
     use std::time::Instant;
 

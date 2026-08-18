@@ -64,7 +64,7 @@ dependencies = [
 [[package]]
 name = "aios_core"
 version = "0.2.0"
-source = "git+https://github.com/happyrust/old-aios-core.git?rev=20990200#209902005984dfdb028253e96a06a456f2b34985"
+source = "git+https://github.com/happyrust/old-aios-core.git?rev=265d98e5#265d98e5f4c86f41b51ec043d10a0fdced9f5f37"
 dependencies = [
  "anyhow",
  "approx 0.5.1",
@@ -2119,7 +2119,7 @@ checksum = "117240f60069e65410b3ae1bb213295bd828f707b5bec6596a1afc8793ce0cbc"
 [[package]]
 name = "dpcsync"
 version = "0.1.0"
-source = "git+https://gitee.com/happydpc/dpc-sync#1432df6b714b6ff1c4c51224cb5fc8d6ce3c8f5b"
+source = "git+https://gitee.com/happydpc/dpc-sync?rev=d7ce7fd848a138e5fc3ebd88ef55da00ee0ac780#d7ce7fd848a138e5fc3ebd88ef55da00ee0ac780"
 dependencies = [
  "async-trait",
  "blake2",
@@ -2130,7 +2130,6 @@ dependencies = [
  "log",
  "num_cpus",
  "prost",
- "prost-build",
  "reqwest 0.11.27",
  "tempfile",
  "tokio",
@@ -3906,12 +3905,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "multimap"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
-
-[[package]]
 name = "nalgebra"
 version = "0.33.0"
 source = "git+https://gitee.com/happydpc/nalgebra#f8f406aaabacc366519903c917ea753b0e43056b"
@@ -4380,7 +4373,7 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
-source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=96ec0d69c0dc365f64be5424a734bb79053080dc#96ec0d69c0dc365f64be5424a734bb79053080dc"
+source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=1e67cacbcc0963ae31da5c4820baf959de6e1145#1e67cacbcc0963ae31da5c4820baf959de6e1145"
 dependencies = [
  "aios_core",
  "anyhow",
@@ -4416,7 +4409,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "smol_str 0.3.2",
- "thiserror 2.0.17",
+ "thiserror 1.0.69",
  "tokio",
 ]
 
@@ -4812,16 +4805,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbc83ee4a840062f368f9096d80077a9841ec117e17e7f700df81958f1451254"
 
 [[package]]
-name = "prettyplease"
-version = "0.2.37"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
-dependencies = [
- "proc-macro2",
- "syn 2.0.107",
-]
-
-[[package]]
 name = "proc-macro-crate"
 version = "1.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4860,27 +4843,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prost-build"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
-dependencies = [
- "bytes",
- "heck 0.5.0",
- "itertools 0.12.1",
- "log",
- "multimap",
- "once_cell",
- "petgraph",
- "prettyplease",
- "prost",
- "prost-types",
- "regex",
- "syn 2.0.107",
- "tempfile",
-]
-
-[[package]]
 name = "prost-derive"
 version = "0.12.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4891,15 +4853,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.107",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.12.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9091c90b0a32608e984ff2fa4091273cbdd755d54935c51d520887f4a1dbd5b0"
-dependencies = [
- "prost",
 ]
 
 [[package]]

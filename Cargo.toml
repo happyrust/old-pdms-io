@@ -9,6 +9,37 @@ edition = "2024"
 default = []            #
 debug_parse = []
 debug_btree_search = [] # 启用B+树搜索调试输出
+legacy_session_replay = [] # 逐会话实体回放，仅诊断/对拍；生产依赖图默认不编译
+
+[[bin]]
+name = "benchmark_increment_eles"
+path = "src/bin/benchmark_increment_eles.rs"
+required-features = ["legacy_session_replay"]
+
+[[bin]]
+name = "demo_latest_data_save"
+path = "src/bin/demo_latest_data_save.rs"
+required-features = ["legacy_session_replay"]
+
+[[bin]]
+name = "test_get_refno_status"
+path = "src/bin/test_get_refno_status.rs"
+required-features = ["legacy_session_replay"]
+
+[[bin]]
+name = "test_increment_eles"
+path = "src/bin/test_increment_eles.rs"
+required-features = ["legacy_session_replay"]
+
+[[bin]]
+name = "test_meilisearch"
+path = "src/bin/test_meilisearch.rs"
+required-features = ["legacy_session_replay"]
+
+[[bin]]
+name = "test_search_integration"
+path = "src/bin/test_search_integration.rs"
+required-features = ["legacy_session_replay"]
 
 [dependencies]
 anyhow = "1.0"
@@ -34,7 +65,7 @@ reqwest = { version = "0.11.22", default-features = false, features = [
     "rustls-tls",
 ] }
 rayon = "1.8.0"
-dpcsync = { git = "https://gitee.com/happydpc/dpc-sync" }
+dpcsync = { git = "https://gitee.com/happydpc/dpc-sync", rev = "d7ce7fd848a138e5fc3ebd88ef55da00ee0ac780" }
 blake2 = "0.10.6"
 futures-util = "0.3.29"
 log = "0.4.20"

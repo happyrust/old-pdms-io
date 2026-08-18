@@ -1,5 +1,8 @@
 # 最新数据收集和保存功能
 
+> 这些接口属于逐会话实体回放诊断面。构建或运行示例时必须显式启用
+> `--features legacy_session_replay`；默认生产依赖图不编译这些入口。
+
 本文档介绍了 PDMS IO 库中新增的最新数据收集和保存功能，主要包括 `collect_latest_eles` 和 `collect_and_save_latest_data` 两个核心方法。
 
 ## 功能概述
