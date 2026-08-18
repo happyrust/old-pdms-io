@@ -77,6 +77,116 @@ pub fn classify_children_delta(old: &RefU64Vec, new: &RefU64Vec) -> ChildrenDelt
     }
 }
 
+/// Compare two parsed versions of one element and return the exact attribute /
+/// explicit-attribute / UDA / ordered-child delta consumed by incremental writes.
+///
+/// This is the single implementation shared by session replay and the
+/// core.dll-style two-root net-window collector. It is intentionally pure:
+/// callers own record lookup and deletion classification; this function only
+/// compares the two resolved element versions.
+pub fn diff_ele_data(prev: &EleData, latest: &EleData) -> Option<ModifiedElement> {
+    let children_changed = (!matches!(
+        classify_children_delta(&prev.children, &latest.children),
+        ChildrenDelta::None
+    ))
+    .then(|| (prev.children.clone(), latest.children.clone()));
+
+    let mut added_attrs = HashMap::new();
+    let mut deleted_attrs = HashMap::new();
+    let mut modified_attrs = HashMap::new();
+    for (name, value) in &latest.att_map().map {
+        match prev.att_map().map.get(name) {
+            Some(prev_value) if prev_value != value => {
+                modified_attrs.insert(name.clone(), (prev_value.clone(), value.clone()));
+            }
+            Some(_) => {}
+            None => {
+                added_attrs.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    for (name, value) in &prev.att_map().map {
+        if !latest.att_map().map.contains_key(name) {
+            deleted_attrs.insert(name.clone(), value.clone());
+        }
+    }
+
+    let mut added_explicit_attrs = HashMap::new();
+    let mut deleted_explicit_attrs = HashMap::new();
+    let mut modified_explicit_attrs = HashMap::new();
+    for (name, value) in &latest.explicit_attmap().map {
+        match prev.explicit_attmap().map.get(name) {
+            Some(prev_value) if prev_value != value => {
+                modified_explicit_attrs.insert(name.clone(), (prev_value.clone(), value.clone()));
+            }
+            Some(_) => {}
+            None => {
+                added_explicit_attrs.insert(name.clone(), value.clone());
+            }
+        }
+    }
+    for (name, value) in &prev.explicit_attmap().map {
+        if !latest.explicit_attmap().map.contains_key(name) {
+            deleted_explicit_attrs.insert(name.clone(), value.clone());
+        }
+    }
+
+    let mut added_uda_attrs = HashMap::new();
+    let mut deleted_uda_attrs = HashMap::new();
+    let mut modified_uda_attrs = HashMap::new();
+    for uda in latest.uda_atts() {
+        match prev
+            .uda_atts()
+            .iter()
+            .find(|prev_uda| prev_uda.hash_val == uda.hash_val)
+        {
+            Some(prev_uda) if prev_uda.value != uda.value => {
+                modified_uda_attrs
+                    .insert(uda.hash_val, (prev_uda.value.clone(), uda.value.clone()));
+            }
+            Some(_) => {}
+            None => {
+                added_uda_attrs.insert(uda.hash_val, uda.value.clone());
+            }
+        }
+    }
+    for prev_uda in prev.uda_atts() {
+        if !latest
+            .uda_atts()
+            .iter()
+            .any(|uda| uda.hash_val == prev_uda.hash_val)
+        {
+            deleted_uda_attrs.insert(prev_uda.hash_val, prev_uda.value.clone());
+        }
+    }
+
+    let changed = children_changed.is_some()
+        || !added_attrs.is_empty()
+        || !deleted_attrs.is_empty()
+        || !modified_attrs.is_empty()
+        || !added_explicit_attrs.is_empty()
+        || !deleted_explicit_attrs.is_empty()
+        || !modified_explicit_attrs.is_empty()
+        || !added_uda_attrs.is_empty()
+        || !deleted_uda_attrs.is_empty()
+        || !modified_uda_attrs.is_empty();
+
+    changed.then(|| ModifiedElement {
+        noun: latest.att_map().get_type(),
+        current_data: latest.clone(),
+        added_attrs,
+        deleted_attrs,
+        modified_attrs,
+        added_explicit_attrs,
+        deleted_explicit_attrs,
+        modified_explicit_attrs,
+        added_uda_attrs,
+        deleted_uda_attrs,
+        modified_uda_attrs,
+        children_changed,
+    })
+}
+
 fn changed_indices<T: PartialEq>(old: &[T], new: &[T]) -> Vec<usize> {
     (0..old.len().max(new.len()))
         .filter(|&index| old.get(index) != new.get(index))
@@ -332,6 +442,108 @@ mod children_delta_tests {
             modified.qualified_attribute_changes(),
             vec![("PARA".into(), 2)]
         );
+    }
+}
+
+#[cfg(test)]
+mod element_diff_tests {
+    use super::{EleData, diff_ele_data};
+    use aios_core::NamedAttrValue;
+    use aios_core::pdms_types::{RefU64, RefU64Vec};
+    use aios_core::types::whole_attmap::ExplicitAttr;
+
+    fn string(value: &str) -> NamedAttrValue {
+        NamedAttrValue::StringType(value.to_owned())
+    }
+
+    fn element(children: &[u64]) -> EleData {
+        let mut data = EleData::default();
+        data.children = RefU64Vec(children.iter().copied().map(RefU64).collect());
+        data
+    }
+
+    fn uda(hash_val: i32, value: &str) -> ExplicitAttr {
+        ExplicitAttr {
+            name: format!(":UDA{hash_val}"),
+            value: string(value),
+            is_uda: true,
+            hash_val,
+        }
+    }
+
+    #[test]
+    fn identical_versions_have_no_delta() {
+        let mut prev = element(&[1, 2]);
+        prev.att_map_mut().map.insert("TYPE".into(), string("BOX"));
+        let latest = prev.clone();
+        assert!(diff_ele_data(&prev, &latest).is_none());
+    }
+
+    #[test]
+    fn all_namespaces_and_ordered_children_share_one_diff_contract() {
+        let mut prev = element(&[1, 2]);
+        prev.att_map_mut().map.extend([
+            ("TYPE".into(), string("BOX")),
+            ("XLEN".into(), string("100")),
+            ("OLD".into(), string("gone")),
+        ]);
+        prev.explicit_attmap_mut().map.extend([
+            ("EXPLICIT".into(), string("before")),
+            ("EXPLICIT_OLD".into(), string("gone")),
+        ]);
+        prev.uda_atts_mut()
+            .extend([uda(10, "before"), uda(20, "gone")]);
+
+        let mut latest = element(&[2, 1]);
+        latest.att_map_mut().map.extend([
+            ("TYPE".into(), string("BOX")),
+            ("XLEN".into(), string("200")),
+            ("NEW".into(), string("added")),
+        ]);
+        latest.explicit_attmap_mut().map.extend([
+            ("EXPLICIT".into(), string("after")),
+            ("EXPLICIT_NEW".into(), string("added")),
+        ]);
+        latest
+            .uda_atts_mut()
+            .extend([uda(10, "after"), uda(30, "added")]);
+
+        let delta = diff_ele_data(&prev, &latest).expect("versions differ");
+        assert_eq!(delta.noun, "BOX");
+        assert!(
+            delta
+                .current_data
+                .children
+                .iter()
+                .eq(latest.children.iter())
+        );
+        assert_eq!(delta.added_attrs.get("NEW"), Some(&string("added")));
+        assert_eq!(delta.deleted_attrs.get("OLD"), Some(&string("gone")));
+        assert_eq!(
+            delta.modified_attrs.get("XLEN"),
+            Some(&(string("100"), string("200")))
+        );
+        assert_eq!(
+            delta.added_explicit_attrs.get("EXPLICIT_NEW"),
+            Some(&string("added"))
+        );
+        assert_eq!(
+            delta.deleted_explicit_attrs.get("EXPLICIT_OLD"),
+            Some(&string("gone"))
+        );
+        assert_eq!(
+            delta.modified_explicit_attrs.get("EXPLICIT"),
+            Some(&(string("before"), string("after")))
+        );
+        assert_eq!(delta.added_uda_attrs.get(&30), Some(&string("added")));
+        assert_eq!(delta.deleted_uda_attrs.get(&20), Some(&string("gone")));
+        assert_eq!(
+            delta.modified_uda_attrs.get(&10),
+            Some(&(string("before"), string("after")))
+        );
+        let (old_children, new_children) = delta.children_changed.expect("ordered child delta");
+        assert!(old_children.iter().eq(prev.children.iter()));
+        assert!(new_children.iter().eq(latest.children.iter()));
     }
 }
 
@@ -1770,7 +1982,7 @@ impl PdmsIO {
 
         // 解包最新版本
         let (latest_sesno, latest_offset) = latest.unwrap();
-        let mut latest_att = match self.parse_raw_element(latest_offset) {
+        let latest_att = match self.parse_raw_element(latest_offset) {
             Ok(att) => att,
             Err(e) => {
                 log::warn!("解析最新元素数据失败: 位置{:#4X} {}", latest_offset, e);
@@ -1814,7 +2026,7 @@ impl PdmsIO {
 
         // 解包前一个版本
         let (prev_sesno, prev_offset) = previous.unwrap();
-        let mut prev_att = match self.parse_raw_element(prev_offset) {
+        let prev_att = match self.parse_raw_element(prev_offset) {
             Ok(att) => att,
             Err(e) => {
                 log::warn!("解析前一版本元素数据失败: {}", e);
@@ -1823,148 +2035,16 @@ impl PdmsIO {
             }
         };
 
-        // 在比较之前保存一份完整的最新数据副本
-        let latest_data_copy = latest_att.clone();
-
-        // 检查子元素是否有变化
-        let latest_children = &latest_att.children;
-        let prev_children = &prev_att.children;
-
-        // 检查children是否发生变化
-        let children_changed = (!matches!(
-            classify_children_delta(prev_children, latest_children),
-            ChildrenDelta::None
-        ))
-        .then(|| (prev_children.clone(), latest_children.clone()));
-
-        // 检查子元素的增删改
-        // 1. 找出已删除的子元素
-        for child_refno in prev_children.iter() {
-            if !latest_children.contains(child_refno) {
-                //todo 有可能是扩展属性
+        // Keep legacy replay's child-delete expansion, but derive the parent element's
+        // Modified payload from the same pure comparison used by the net-window path.
+        for child_refno in prev_att.children.iter() {
+            if !latest_att.children.contains(child_refno) {
                 result.insert(*child_refno, EleOperationDetail::Deleted);
             }
         }
 
-        //首先检查是否是属于有几何体的类型。
-        //然后是检查发生修改的属性是什么
-        let mut is_children_changed = children_changed.is_some();
-
-        // 存储属性变化
-        let mut added_attrs = HashMap::new();
-        let mut deleted_attrs = HashMap::new();
-        let mut modified_attrs = HashMap::new();
-
-        // 检查普通属性的变化
-        while let Some((noun, value)) = latest_att.att_map_mut().pop_first() {
-            if let Some(prev_value) = prev_att.att_map_mut().remove(&noun) {
-                if value != prev_value {
-                    is_children_changed = true;
-                    modified_attrs.insert(noun, (prev_value.clone(), value));
-                }
-            } else {
-                // 新增的属性
-                is_children_changed = true;
-                added_attrs.insert(noun, value);
-            }
-        }
-
-        // 检查被删除的属性
-        for (noun, value) in prev_att.att_map().iter() {
-            if !latest_att.att_map().contains_key(noun) {
-                is_children_changed = true;
-                deleted_attrs.insert(noun.clone(), value.clone());
-            }
-        }
-
-        // 存储显式属性变化
-        let mut added_explicit_attrs = HashMap::new();
-        let mut deleted_explicit_attrs = HashMap::new();
-        let mut modified_explicit_attrs = HashMap::new();
-
-        // 检查显式属性是否发生变化
-        let latest_explicit_attmap = latest_att.explicit_attmap();
-        let prev_explicit_attmap = prev_att.explicit_attmap();
-
-        for (noun, value) in latest_explicit_attmap.iter() {
-            if let Some(prev_value) = prev_explicit_attmap.get(noun) {
-                if value != prev_value {
-                    is_children_changed = true;
-                    modified_explicit_attrs
-                        .insert(noun.clone(), (prev_value.clone(), value.clone()));
-                }
-            } else {
-                // 新增的显式属性
-                is_children_changed = true;
-                added_explicit_attrs.insert(noun.clone(), value.clone());
-            }
-        }
-
-        // 检查被删除的显式属性
-        for (noun, value) in prev_explicit_attmap.iter() {
-            if !latest_explicit_attmap.contains_key(noun) {
-                is_children_changed = true;
-                deleted_explicit_attrs.insert(noun.clone(), value.clone());
-            }
-        }
-
-        // 存储UDA属性变化
-        let mut added_uda_attrs = HashMap::new();
-        let mut deleted_uda_attrs = HashMap::new();
-        let mut modified_uda_attrs = HashMap::new();
-
-        // 检查uda属性是否发生变化
-        let latest_uda_atts = latest_att.uda_atts();
-        let prev_uda_atts = prev_att.uda_atts();
-
-        for uda_att in latest_uda_atts.iter() {
-            if let Some(prev_value) = prev_uda_atts
-                .iter()
-                .find(|x| x.hash_val == uda_att.hash_val)
-            {
-                if uda_att.value != prev_value.value {
-                    is_children_changed = true;
-                    modified_uda_attrs.insert(
-                        uda_att.hash_val,
-                        (prev_value.value.clone(), uda_att.value.clone()),
-                    );
-                }
-            } else {
-                // 新增的uda属性
-                is_children_changed = true;
-                added_uda_attrs.insert(uda_att.hash_val, uda_att.value.clone());
-            }
-        }
-
-        // 检查被删除的UDA属性
-        for prev_uda in prev_uda_atts.iter() {
-            if !latest_uda_atts
-                .iter()
-                .any(|x| x.hash_val == prev_uda.hash_val)
-            {
-                is_children_changed = true;
-                deleted_uda_attrs.insert(prev_uda.hash_val, prev_uda.value.clone());
-            }
-        }
-
-        if is_children_changed {
-            result.insert(
-                refno,
-                EleOperationDetail::Modified(ModifiedElement {
-                    current_data: latest_data_copy,
-                    added_attrs,
-                    deleted_attrs,
-                    modified_attrs,
-                    added_explicit_attrs,
-                    deleted_explicit_attrs,
-                    modified_explicit_attrs,
-                    added_uda_attrs,
-                    deleted_uda_attrs,
-                    modified_uda_attrs,
-                    noun: type_name.clone(),
-                    children_changed,
-                }),
-            );
+        if let Some(modified) = diff_ele_data(&prev_att, &latest_att) {
+            result.insert(refno, EleOperationDetail::Modified(modified));
         }
 
         Ok(result)
