@@ -3,7 +3,11 @@ pub mod config;
 pub mod defines;
 #[allow(warnings)]
 pub mod io;
+/// 净窗口收集：会话索引差分的净三态 → 与逐会话回放同形状的操作流。
+pub mod net_window;
 pub mod search;
+/// 会话索引双根差分：给定库文件与 sesno 窗口，只靠文件本身判净增删改。
+pub mod session_index_diff;
 pub mod test;
 
 pub mod sync;
