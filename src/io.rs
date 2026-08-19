@@ -545,6 +545,26 @@ mod element_diff_tests {
         assert!(old_children.iter().eq(prev.children.iter()));
         assert!(new_children.iter().eq(latest.children.iter()));
     }
+
+    #[test]
+    fn raw_uda_hash_value_path_preserves_add_modify_delete() {
+        let mut previous = element(&[]);
+        previous
+            .uda_atts_mut()
+            .extend([uda(101, "before"), uda(202, "deleted")]);
+        let mut latest = element(&[]);
+        latest
+            .uda_atts_mut()
+            .extend([uda(101, "after"), uda(303, "added")]);
+
+        let delta = diff_ele_data(&previous, &latest).expect("UDA delta");
+        assert_eq!(
+            delta.modified_uda_attrs.get(&101),
+            Some(&(string("before"), string("after")))
+        );
+        assert_eq!(delta.deleted_uda_attrs.get(&202), Some(&string("deleted")));
+        assert_eq!(delta.added_uda_attrs.get(&303), Some(&string("added")));
+    }
 }
 
 #[cfg(test)]
@@ -1409,6 +1429,14 @@ pub struct PdmsIO {
     historical_raw_cache: HashMap<(u32, RefU64), EleData>,
 }
 
+fn raw_element_payload(data: &[u8]) -> &[u8] {
+    if data.starts_with(&[0, 0, 0, 0x7]) {
+        &data[4..]
+    } else {
+        data
+    }
+}
+
 impl PdmsIO {
     #[inline]
     pub fn read_bytes(&mut self, offset: u32, len: i32) -> anyhow::Result<Vec<u8>> {
@@ -1682,6 +1710,15 @@ enum SesSqlType {
     PeOwnerSql(Vec<String>),
 }
 
+pub(crate) fn read_exact_prefix_from_file(file: &mut File, len: u64) -> anyhow::Result<Vec<u8>> {
+    let len = usize::try_from(len)
+        .map_err(|_| anyhow::anyhow!("冻结文件长度 {len} 超过当前平台可分配范围"))?;
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
 impl PdmsIO {
     ///新建一个PdmsIO
     pub fn new<P: AsRef<Path>>(project: impl ToString, path: P, readonly: bool) -> Self {
@@ -1704,6 +1741,24 @@ impl PdmsIO {
         self.file = Some(file);
         self.init_ses_range_map()?;
         Ok(())
+    }
+
+    /// Metadata for the exact file handle owned by this reader.
+    ///
+    /// Snapshot callers must use this instead of re-opening `self.path`, because
+    /// the path may have been atomically replaced after [`PdmsIO::open`].
+    pub fn opened_file_metadata(&mut self) -> anyhow::Result<std::fs::Metadata> {
+        Ok(self.get_file()?.metadata()?)
+    }
+
+    /// Read exactly the frozen prefix from the already-open handle.
+    ///
+    /// A dabacon file may append after the snapshot opens. Reading to EOF would
+    /// mix the later generation into a baseline whose token still names the old
+    /// target session.
+    pub fn read_exact_prefix_from_opened_file(&mut self, len: u64) -> anyhow::Result<Vec<u8>> {
+        let file = self.get_file()?;
+        read_exact_prefix_from_file(file, len)
     }
 
     fn get_file(&mut self) -> anyhow::Result<&mut File> {
@@ -2912,21 +2967,33 @@ impl PdmsIO {
     /// * `refno_offset` - 元素在文件中的偏移量
     ///
     pub fn parse_raw_element(&mut self, refno_offset: u64) -> anyhow::Result<EleData> {
-        let mut file = self.get_file()?;
-        let mut data = vec![0u8; 0x800];
-        file.seek(SeekFrom::Start(refno_offset))?;
-        file.read_exact(&mut data)?;
-
-        let input = if data[..4] == [0, 0, 0, 0x7] {
-            &data[4..]
-        } else {
-            &data[..]
-        };
+        let data = self.read_raw_element_record(refno_offset)?;
+        let input = raw_element_payload(&data);
         let ele_data = parse_raw_ele_data(input)?;
         // let pgno = (refno_offset / 0x800) as u32;
         // let sesno = self.get_sesno(pgno).unwrap_or_default() as i32;
         // ele_data.att_map_mut().set_sesno(sesno);
         Ok(ele_data)
+    }
+
+    /// Decode only the fixed record identity fields at `refno_offset`.
+    ///
+    /// This remains available when canonical attribute decoding fails because a
+    /// noun is absent from the attribute dictionary.
+    pub fn parse_raw_element_identity(
+        &mut self,
+        refno_offset: u64,
+    ) -> anyhow::Result<RawElementIdentity> {
+        let data = self.read_raw_element_record(refno_offset)?;
+        parse_pdms_db::parse::parse_raw_element_identity(raw_element_payload(&data))
+    }
+
+    fn read_raw_element_record(&mut self, refno_offset: u64) -> anyhow::Result<Vec<u8>> {
+        let file = self.get_file()?;
+        let mut data = vec![0u8; 0x800];
+        file.seek(SeekFrom::Start(refno_offset))?;
+        file.read_exact(&mut data)?;
+        Ok(data)
     }
 
     //TODO 做一个不处理UDA的方法
@@ -2962,22 +3029,16 @@ impl PdmsIO {
     /// before that session).  Increment classification uses this for OWNER
     /// membership so a later parent deletion cannot rewrite an earlier
     /// session's result.
-    fn raw_element_at_or_before(
-        &mut self,
-        refno: RefU64,
-        sesno: u32,
-    ) -> anyhow::Result<EleData> {
+    fn raw_element_at_or_before(&mut self, refno: RefU64, sesno: u32) -> anyhow::Result<EleData> {
         if let Some(cached) = self.historical_raw_cache.get(&(sesno, refno)) {
             return Ok(cached.clone());
         }
 
-        let (_, offset) = self
-            .search_latest_refno(refno, Some(sesno))
-            .ok_or(anyhow!(
-                "找不到会话 {} 或之前的参考号: {:?}",
-                sesno,
-                refno
-            ))?;
+        let (_, offset) = self.search_latest_refno(refno, Some(sesno)).ok_or(anyhow!(
+            "找不到会话 {} 或之前的参考号: {:?}",
+            sesno,
+            refno
+        ))?;
         let ele_data = self.parse_raw_element(offset)?;
         self.historical_raw_cache
             .insert((sesno, refno), ele_data.clone());

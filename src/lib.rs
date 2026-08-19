@@ -1,3 +1,5 @@
+#![feature(windows_by_handle)]
+
 pub mod common;
 pub mod config;
 pub mod defines;
@@ -8,6 +10,7 @@ pub mod net_window;
 pub mod search;
 /// 会话索引双根差分：给定库文件与 sesno 窗口，只靠文件本身判净增删改。
 pub mod session_index_diff;
+pub mod snapshot;
 pub mod test;
 
 pub mod sync;

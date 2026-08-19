@@ -15,18 +15,60 @@
 //! 与会话索引差分同一条**纯文件纪律**：不查库、不读水位，窗口由调用方显式给定
 //! （见 `the_net_window_module_never_touches_the_database` 源码断言）。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::RangeInclusive;
 
 use aios_core::pdms_types::RefU64;
-use parse_pdms_db::parse::EleData;
+use parse_pdms_db::parse::{EleData, RawElementIdentity};
 
 pub use crate::io::diff_ele_data;
 use crate::io::{EleOperationData, EleOperationDetail, PdmsIO};
 use crate::session_index_diff::{self, RecordLoc};
+use crate::snapshot::{DabaconSnapshot, SnapshotToken};
+
+#[derive(Debug)]
+pub struct NetWindowError {
+    stage: &'static str,
+    source: anyhow::Error,
+}
+
+impl NetWindowError {
+    fn incomplete(stage: &'static str, source: impl Into<anyhow::Error>) -> Self {
+        Self {
+            stage,
+            source: source.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for NetWindowError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "dabacon 窗口在 {} 阶段不完整: {:#}",
+            self.stage, self.source
+        )
+    }
+}
+
+impl std::error::Error for NetWindowError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredFinalRecord {
+    pub refno: RefU64,
+    pub noun: String,
+    pub reason: String,
+}
 
 /// 一次净窗口收集的产物。
+#[derive(Debug)]
 pub struct NetWindowOutcome {
+    /// Token proving which open file handle and target root produced the window.
+    pub snapshot_token: Option<SnapshotToken>,
     /// 与回放收集同形状的操作流（每 refno 恰一条，挂 last-touch 会话）。
     pub window: BTreeMap<u32, Vec<EleOperationData>>,
     /// 必须进回执的收集警告（如「基版本解析失败，按新增全量处理」）——
@@ -35,12 +77,17 @@ pub struct NetWindowOutcome {
     /// 记录位置变了但内容逐字段相同（原样重写换页）的条目数：不发操作，
     /// 但账要看得见。
     pub unchanged_rewrites: usize,
-    /// 终稿记录解析失败而跳过的条目数（多为字典缺项的系统记录，如 MNUM 不在
-    /// 属性表——回放路径对同一批记录同样以 `None` 操作落空，从未入过库）。
-    /// 明细以聚合警告随回执透出。cea58087（08-14）曾把它升为整窗硬错误，
-    /// 真实文件上每个含系统段的窗口整批打死（08-17 实测 ams8000 的 `16192_1`
-    /// 必现），已回退为与回放等价的跳过 + 记账。
+    /// 最小身份明确为 MNUM、按代码白名单跳过的终稿数。其他 noun 的终稿失败
+    /// 无法构造 `NetWindowOutcome`。
     pub unparseable_finals: usize,
+    /// The only accepted final-decode omissions. This list is produced by the
+    /// code allowlist below and cannot be extended through runtime options.
+    pub ignored_finals: Vec<IgnoredFinalRecord>,
+    /// 双根差分之外，由父成员净减少 + 目标 OWNER 成员关系补出的删除数。
+    ///
+    /// E3D 删除后旧物理记录可能仍被索引遍历触达；只有这个计数能把“索引仍见、
+    /// 成员关系已死”的收口显式暴露给上层口径日志。
+    pub membership_deleted: usize,
     /// 差分统计（页读数/剪枝/耗时），随回执与日志透出。
     pub stats: session_index_diff::NetChangeStats,
 }
@@ -49,36 +96,342 @@ pub struct NetWindowOutcome {
 ///
 /// 失败语义（与回放口径逐条对齐，不许静默）：
 ///
-/// * 净新增 / 净修改的**终稿**记录解析失败 → 跳过该条 + 计数 + 聚合警告。
-///   真实库里这是字典缺项的系统记录家族（如 `MNUM not exist in attr_info_map`，
-///   ams8000 的 `16192_1`）——回放路径对同一批记录以 `None` 操作落空、从未
-///   入库，硬失败会让每个含系统段的窗口整批打死，而跳过与回放行为等价。
+/// * 净新增 / 净修改的**终稿**记录解析失败 → 先解最小身份；只有代码白名单
+///   `MNUM` 可跳过并记录结构化诊断，其他 noun 立即令窗口失败。
 /// * 净修改的**基版本**解析失败（终稿可读）→ 按 spec §Edge Cases 保守处理：
 ///   当作新增全量覆盖（模型侧整根重生成），warnings 逐条点名。
 /// * 净修改条目缺 `base_loc` → **硬失败**：那是差分分类的不变量被破坏，不是
 ///   现场异常，不许降级。
 pub fn collect_net_window(
-    io: &mut PdmsIO,
+    snapshot: &mut DabaconSnapshot,
     sesno_range: RangeInclusive<i32>,
-) -> anyhow::Result<NetWindowOutcome> {
-    let net = session_index_diff::collect_net_changes(io, sesno_range, false)?;
-    synthesize_net_window(net, |loc| io.parse_raw_element(loc.att_offset()))
+) -> Result<NetWindowOutcome, NetWindowError> {
+    snapshot
+        .verify_path_identity()
+        .map_err(|error| NetWindowError::incomplete("冻结文件身份校验", error))?;
+    let requested_target = *sesno_range.end();
+    if requested_target < 0 || requested_target as u32 != snapshot.token().target_sesno() {
+        return Err(NetWindowError::incomplete(
+            "冻结会话校验",
+            anyhow::anyhow!(
+                "窗口终点 {requested_target} 与快照冻结会话 {} 不一致",
+                snapshot.token().target_sesno()
+            ),
+        ));
+    }
+    let token = snapshot.token().clone();
+    let io = snapshot.io_mut();
+    let net = session_index_diff::collect_net_changes(io, sesno_range, false)
+        .map_err(|error| NetWindowError::incomplete("双根差分", error))?;
+    let base_sesno = net.base_sesno;
+    let target_sesno = net.target_sesno;
+    let mut resolver = PdmsRecordResolver { io };
+    let mut outcome = synthesize_net_window_with_resolver(net, token.clone(), &mut resolver)
+        .map_err(|error| NetWindowError::incomplete("终稿合成", error))?;
+    outcome.membership_deleted = reconcile_member_deletions(
+        &mut outcome.window,
+        base_sesno,
+        target_sesno,
+        &mut PdmsMembershipResolver { io: resolver.io },
+    )
+    .map_err(|error| NetWindowError::incomplete("成员删除收口", error))?;
+    snapshot
+        .verify_path_identity()
+        .map_err(|error| NetWindowError::incomplete("提交前文件身份校验", error))?;
+    Ok(outcome)
+}
+
+/// 固定会话下的元素解析窄接口：生产走 dabacon 点查，纯测试用内存桩。
+trait MembershipResolver {
+    fn element_at(&mut self, refno: RefU64, sesno: i32) -> anyhow::Result<Option<EleData>>;
+}
+
+struct PdmsMembershipResolver<'a> {
+    io: &'a mut PdmsIO,
+}
+
+/// 维护审计入口：判断非 WORL 元素在指定会话是否仍被 OWNER 成员表接纳。
+pub fn member_alive_at(io: &mut PdmsIO, refno: RefU64, target_sesno: i32) -> anyhow::Result<bool> {
+    is_target_member(&mut PdmsMembershipResolver { io }, refno, target_sesno)
+}
+
+/// 维护审计入口：将已确认不可达的根按基会话成员树展开为完整删除集。
+pub fn expand_deleted_membership_roots(
+    io: &mut PdmsIO,
+    roots: &BTreeSet<RefU64>,
+    base_sesno: i32,
+    target_sesno: i32,
+) -> anyhow::Result<BTreeSet<RefU64>> {
+    let target = u32::try_from(target_sesno)
+        .map_err(|_| anyhow::anyhow!("成员审计目标会话非法: {target_sesno}"))?;
+    let mut window = BTreeMap::from([(
+        target,
+        roots
+            .iter()
+            .copied()
+            .map(|refno| EleOperationData::new(refno, target, EleOperationDetail::Deleted))
+            .collect(),
+    )]);
+    reconcile_member_deletions(
+        &mut window,
+        Some(base_sesno),
+        target_sesno,
+        &mut PdmsMembershipResolver { io },
+    )?;
+    Ok(window
+        .values()
+        .flatten()
+        .map(|operation| operation.refno)
+        .collect())
+}
+
+impl MembershipResolver for PdmsMembershipResolver<'_> {
+    fn element_at(&mut self, refno: RefU64, sesno: i32) -> anyhow::Result<Option<EleData>> {
+        let sesno =
+            u32::try_from(sesno).map_err(|_| anyhow::anyhow!("成员仲裁会话号非法: {sesno}"))?;
+        let Some((_, offset)) = self.io.search_latest_refno(refno, Some(sesno)) else {
+            return Ok(None);
+        };
+        self.io
+            .parse_raw_element(offset)
+            .map(Some)
+            .map_err(|error| {
+                anyhow::anyhow!("解析 {refno} 在 sesno={sesno} 的成员记录失败: {error}")
+            })
+    }
+}
+
+/// 从父成员净变化里收集 `old - new` 与 `new - old`。
+fn member_deltas(
+    window: &BTreeMap<u32, Vec<EleOperationData>>,
+) -> (BTreeSet<RefU64>, BTreeSet<RefU64>) {
+    let mut removed = BTreeSet::new();
+    let mut attached = BTreeSet::new();
+    for modified in window.values().flatten().filter_map(|operation| {
+        let EleOperationDetail::Modified(modified) = &operation.detail else {
+            return None;
+        };
+        modified.children_changed.as_ref()
+    }) {
+        let (old, new) = modified;
+        let old = old.iter().copied().collect::<BTreeSet<_>>();
+        let new = new.iter().copied().collect::<BTreeSet<_>>();
+        removed.extend(old.difference(&new).copied());
+        attached.extend(new.difference(&old).copied());
+    }
+    (removed, attached)
+}
+
+/// 判断元素在目标会话是否仍被其目标 OWNER 的成员表接纳。
+fn is_target_member<R: MembershipResolver>(
+    resolver: &mut R,
+    refno: RefU64,
+    target_sesno: i32,
+) -> anyhow::Result<bool> {
+    let Some(element) = resolver.element_at(refno, target_sesno)? else {
+        return Ok(false);
+    };
+    anyhow::ensure!(
+        element.owner != RefU64::default(),
+        "成员删除候选 {refno} 在 sesno={target_sesno} 的 OWNER 为空"
+    );
+    let owner = resolver
+        .element_at(element.owner, target_sesno)?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "成员删除候选 {refno} 的 OWNER {} 在 sesno={target_sesno} 不存在",
+                element.owner
+            )
+        })?;
+    Ok(owner.children.contains(&refno))
+}
+
+/// 用目标成员关系收口删除，并沿基版本成员树展开不可达子树。
+///
+/// 返回本轮新补出的 `Deleted` 数；双根差分本来已有的删除不计入该数字。
+fn reconcile_member_deletions<R: MembershipResolver>(
+    window: &mut BTreeMap<u32, Vec<EleOperationData>>,
+    base_sesno: Option<i32>,
+    target_sesno: i32,
+    resolver: &mut R,
+) -> anyhow::Result<usize> {
+    let (removed, attached) = member_deltas(window);
+    let existing_deleted = window
+        .values()
+        .flatten()
+        .filter(|operation| matches!(operation.detail, EleOperationDetail::Deleted))
+        .map(|operation| operation.refno)
+        .collect::<BTreeSet<_>>();
+    let roots = removed
+        .difference(&attached)
+        .copied()
+        .chain(existing_deleted.iter().copied())
+        .collect::<BTreeSet<_>>();
+    if roots.is_empty() {
+        return Ok(0);
+    }
+    let base_sesno = base_sesno
+        .ok_or_else(|| anyhow::anyhow!("成员删除候选存在，但窗口没有可展开删除子树的基会话"))?;
+
+    let mut dead = BTreeSet::new();
+    let mut queue = VecDeque::new();
+    for root in roots {
+        if existing_deleted.contains(&root) || !is_target_member(resolver, root, target_sesno)? {
+            queue.push_back(root);
+        }
+    }
+
+    while let Some(refno) = queue.pop_front() {
+        if !dead.insert(refno) {
+            continue;
+        }
+        let base = resolver.element_at(refno, base_sesno)?.ok_or_else(|| {
+            anyhow::anyhow!("删除子树元素 {refno} 在基会话 sesno={base_sesno} 不存在，拒绝猜测")
+        })?;
+        for child in base.children.iter().copied() {
+            if dead.contains(&child) {
+                continue;
+            }
+            let target = resolver.element_at(child, target_sesno)?;
+            let moved_to_live_owner = match target {
+                None => false,
+                Some(target) if dead.contains(&target.owner) => false,
+                Some(target) => {
+                    anyhow::ensure!(
+                        target.owner != RefU64::default(),
+                        "删除子树成员 {child} 在 sesno={target_sesno} 的 OWNER 为空"
+                    );
+                    resolver
+                        .element_at(target.owner, target_sesno)?
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "删除子树成员 {child} 的目标 OWNER {} 不存在",
+                                target.owner
+                            )
+                        })?
+                        .children
+                        .contains(&child)
+                }
+            };
+            if !moved_to_live_owner {
+                queue.push_back(child);
+            }
+        }
+    }
+
+    if dead.is_empty() {
+        return Ok(0);
+    }
+    // 终态唯一：成员删除覆盖同 refno 的 Add/Modified，也与索引 Deleted 去重。
+    for operations in window.values_mut() {
+        operations.retain(|operation| !dead.contains(&operation.refno));
+    }
+    let membership_deleted = dead.difference(&existing_deleted).count();
+    let target = u32::try_from(target_sesno)
+        .map_err(|_| anyhow::anyhow!("成员删除目标会话非法: {target_sesno}"))?;
+    let operations = window.entry(target).or_default();
+    operations.extend(
+        dead.into_iter()
+            .map(|refno| EleOperationData::new(refno, target, EleOperationDetail::Deleted)),
+    );
+    Ok(membership_deleted)
+}
+
+trait RecordResolver {
+    fn element_at(&mut self, loc: RecordLoc) -> anyhow::Result<EleData>;
+    fn identity_at(&mut self, loc: RecordLoc) -> anyhow::Result<RawElementIdentity>;
+}
+
+struct PdmsRecordResolver<'a> {
+    io: &'a mut PdmsIO,
+}
+
+impl RecordResolver for PdmsRecordResolver<'_> {
+    fn element_at(&mut self, loc: RecordLoc) -> anyhow::Result<EleData> {
+        self.io.parse_raw_element(loc.att_offset())
+    }
+
+    fn identity_at(&mut self, loc: RecordLoc) -> anyhow::Result<RawElementIdentity> {
+        self.io.parse_raw_element_identity(loc.att_offset())
+    }
+}
+
+#[cfg(test)]
+struct ClosureRecordResolver<F> {
+    resolve: F,
+}
+
+#[cfg(test)]
+impl<F> RecordResolver for ClosureRecordResolver<F>
+where
+    F: FnMut(RecordLoc) -> anyhow::Result<EleData>,
+{
+    fn element_at(&mut self, loc: RecordLoc) -> anyhow::Result<EleData> {
+        (self.resolve)(loc)
+    }
+
+    fn identity_at(&mut self, loc: RecordLoc) -> anyhow::Result<RawElementIdentity> {
+        let data = (self.resolve)(loc)?;
+        Ok(RawElementIdentity {
+            refno: data.refno,
+            noun_hash: data.noun as i32,
+            noun_name: aios_core::tool::db_tool::db1_dehash(data.noun),
+            owner: data.owner,
+        })
+    }
+}
+
+fn allowed_ignored_final(
+    resolver: &mut impl RecordResolver,
+    expected_refno: RefU64,
+    loc: RecordLoc,
+    decode_error: anyhow::Error,
+) -> anyhow::Result<IgnoredFinalRecord> {
+    let identity = resolver.identity_at(loc).map_err(|identity_error| {
+        anyhow::anyhow!(
+            "解析 {expected_refno} 的终稿失败，最小身份也无法解码；终稿错误: {decode_error:#}; 身份错误: {identity_error:#}"
+        )
+    })?;
+    anyhow::ensure!(
+        identity.refno == expected_refno,
+        "终稿位置返回错误 refno：期望 {expected_refno}，实际 {}",
+        identity.refno
+    );
+    anyhow::ensure!(
+        identity.noun_name == "MNUM",
+        "非白名单终稿 {expected_refno}（noun={}）解析失败: {decode_error:#}",
+        identity.noun_name
+    );
+    Ok(IgnoredFinalRecord {
+        refno: expected_refno,
+        noun: identity.noun_name,
+        reason: format!("{decode_error:#}"),
+    })
 }
 
 /// 纯合成层：净三态 → 与回放同形状的操作流。**不碰 IO、不碰库**——记录解析由
-/// `resolve` 注入（生产是 `PdmsIO::parse_raw_element`，单测是内存桩），于是三
-/// 形状与三条降级路径全部进得了 CI 纯单测（ADR-022 验收 1）。
+/// resolver 注入（生产是 `PdmsIO`，单测是内存桩）。
 ///
 /// `net` 按值接收：`stats` 直接移交 [`NetWindowOutcome`]，条目也不必逐条 clone。
 /// resolver 收窄成「给我这个位置的记录」，「谁的记录 / 哪一端 / 页与偏移」由
 /// [`resolve_record`] 包装——错误文案只有一处权威，测试不必复刻它。
+#[cfg(test)]
 fn synthesize_net_window<F>(
     net: session_index_diff::NetChangeSet,
-    mut resolve: F,
+    resolve: F,
 ) -> anyhow::Result<NetWindowOutcome>
 where
     F: FnMut(RecordLoc) -> anyhow::Result<EleData>,
 {
+    let mut resolver = ClosureRecordResolver { resolve };
+    synthesize_net_window_with_resolver(net, SnapshotToken::for_test(), &mut resolver)
+}
+
+fn synthesize_net_window_with_resolver(
+    net: session_index_diff::NetChangeSet,
+    snapshot_token: SnapshotToken,
+    resolver: &mut impl RecordResolver,
+) -> anyhow::Result<NetWindowOutcome> {
     let target_sesno = net.target_sesno.max(0) as u32;
     let session_index_diff::NetChangeSet {
         added,
@@ -91,7 +444,7 @@ where
     let mut window: BTreeMap<u32, Vec<EleOperationData>> = BTreeMap::new();
     let mut warnings: Vec<String> = Vec::new();
     let mut unchanged_rewrites = 0usize;
-    let mut unparseable: Vec<String> = Vec::new();
+    let mut ignored_finals: Vec<IgnoredFinalRecord> = Vec::new();
     let mut push = |window: &mut BTreeMap<u32, Vec<EleOperationData>>,
                     sesno: u32,
                     refno: RefU64,
@@ -108,14 +461,19 @@ where
                 .last_touch_sesno
                 .ok_or_else(|| anyhow::anyhow!("净新增 {} 缺 last-touch 会话", entry.refno))?,
         )?;
-        match resolve_record(&mut resolve, entry.refno, entry.loc, "终稿") {
+        match resolve_record(resolver, entry.refno, entry.loc, "终稿") {
             Ok(data) => push(
                 &mut window,
                 sesno,
                 entry.refno,
                 EleOperationDetail::Add(data),
             ),
-            Err(error) => unparseable.push(format!("{}: {error:#}", entry.refno)),
+            Err(error) => ignored_finals.push(allowed_ignored_final(
+                resolver,
+                entry.refno,
+                entry.loc,
+                error,
+            )?),
         }
     }
 
@@ -134,10 +492,15 @@ where
                 .last_touch_sesno
                 .ok_or_else(|| anyhow::anyhow!("净修改 {} 缺 last-touch 会话", entry.refno))?,
         )?;
-        let latest = match resolve_record(&mut resolve, entry.refno, entry.loc, "终稿") {
+        let latest = match resolve_record(resolver, entry.refno, entry.loc, "终稿") {
             Ok(latest) => latest,
             Err(error) => {
-                unparseable.push(format!("{}: {error:#}", entry.refno));
+                ignored_finals.push(allowed_ignored_final(
+                    resolver,
+                    entry.refno,
+                    entry.loc,
+                    error,
+                )?);
                 continue;
             }
         };
@@ -147,7 +510,7 @@ where
                 entry.refno
             )
         })?;
-        match resolve_record(&mut resolve, entry.refno, base_loc, "基版本") {
+        match resolve_record(resolver, entry.refno, base_loc, "基版本") {
             Ok(base) => match diff_ele_data(&base, &latest) {
                 Some(modified) => push(
                     &mut window,
@@ -172,47 +535,54 @@ where
         }
     }
 
-    if !unparseable.is_empty() {
-        let samples = unparseable
+    if !ignored_finals.is_empty() {
+        let samples = ignored_finals
             .iter()
             .take(5)
-            .cloned()
+            .map(|ignored| format!("{}({}): {}", ignored.refno, ignored.noun, ignored.reason))
             .collect::<Vec<_>>()
             .join("；");
         warnings.push(format!(
-            "{} 条记录终稿解析失败，按回放同口径跳过（这些记录在回放路径同样以 None \
-             操作落空、从未入库，多为字典缺项的系统记录）。样例：{samples}",
-            unparseable.len()
+            "{} 条 MNUM 系统记录终稿解析失败，按代码白名单跳过且不生成 PE 操作。样例：{samples}",
+            ignored_finals.len()
         ));
     }
 
     Ok(NetWindowOutcome {
+        snapshot_token: Some(snapshot_token),
         window,
         warnings,
         unchanged_rewrites,
-        unparseable_finals: unparseable.len(),
+        unparseable_finals: ignored_finals.len(),
+        ignored_finals,
+        membership_deleted: 0,
         stats,
     })
 }
 
 /// 给一次记录解析套上「谁的记录、哪一端、页与偏移」——出错时光有底层报错认不出
 /// 是哪条元素的哪一端。
-fn resolve_record<F>(
-    resolve: &mut F,
+fn resolve_record(
+    resolver: &mut impl RecordResolver,
     refno: RefU64,
     loc: RecordLoc,
     side: &str,
-) -> anyhow::Result<EleData>
-where
-    F: FnMut(RecordLoc) -> anyhow::Result<EleData>,
-{
-    resolve(loc).map_err(|error| {
+) -> anyhow::Result<EleData> {
+    let decoded = resolver.element_at(loc).map_err(|error| {
         anyhow::anyhow!(
             "解析 {refno} 的{side}记录（页 {} 偏移 {}）失败: {error}",
             loc.pgno,
             loc.offset
         )
-    })
+    })?;
+    anyhow::ensure!(
+        decoded.refno == refno,
+        "解析 {refno} 的{side}记录（页 {} 偏移 {}）返回错误 refno {}",
+        loc.pgno,
+        loc.offset,
+        decoded.refno
+    );
+    Ok(decoded)
 }
 
 /// The two-version element comparison is owned by `crate::io::diff_ele_data` and
@@ -224,6 +594,7 @@ where
 mod tests {
     use super::*;
     use aios_core::NamedAttrValue;
+    use std::collections::{BTreeSet, HashMap};
 
     /// T14：净窗口不得再长出一份属性/成员 diff；编译期 import 保证共享函数存在，
     /// 源码断言保证这里没有悄悄复制回来一份同名实现。
@@ -255,6 +626,170 @@ mod tests {
             data.children.0.push(RefU64(child));
         }
         data
+    }
+
+    #[derive(Default)]
+    struct FakeMembershipResolver {
+        elements: HashMap<(i32, RefU64), EleData>,
+        failures: BTreeSet<(i32, RefU64)>,
+    }
+
+    impl MembershipResolver for FakeMembershipResolver {
+        fn element_at(&mut self, refno: RefU64, sesno: i32) -> anyhow::Result<Option<EleData>> {
+            if self.failures.contains(&(sesno, refno)) {
+                anyhow::bail!("injected member parse failure for {refno}@{sesno}");
+            }
+            Ok(self.elements.get(&(sesno, refno)).cloned())
+        }
+    }
+
+    fn owned(refno: u64, owner: u64, children: &[u64]) -> EleData {
+        let mut data = element(&[("TYPE", "STRU")], children);
+        data.refno = RefU64(refno);
+        data.owner = RefU64(owner);
+        data
+    }
+
+    fn parent_modified(
+        parent: u64,
+        owner: u64,
+        old_children: &[u64],
+        new_children: &[u64],
+        sesno: u32,
+    ) -> EleOperationData {
+        let before = owned(parent, owner, old_children);
+        let after = owned(parent, owner, new_children);
+        EleOperationData::new(
+            RefU64(parent),
+            sesno,
+            EleOperationDetail::Modified(diff_ele_data(&before, &after).expect("member delta")),
+        )
+    }
+
+    fn operation_kinds(
+        window: &BTreeMap<u32, Vec<EleOperationData>>,
+    ) -> BTreeMap<RefU64, &'static str> {
+        window
+            .values()
+            .flatten()
+            .map(|operation| {
+                let kind = match operation.detail {
+                    EleOperationDetail::Add(_) => "add",
+                    EleOperationDetail::Modified(_) => "modified",
+                    EleOperationDetail::Deleted => "deleted",
+                    EleOperationDetail::None => "none",
+                };
+                (operation.refno, kind)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn stale_index_record_removed_from_owner_becomes_deleted() {
+        let (owner, parent, child) = (1, 10, 20);
+        let mut window =
+            BTreeMap::from([(2, vec![parent_modified(parent, owner, &[child], &[], 2)])]);
+        let mut resolver = FakeMembershipResolver::default();
+        for (sesno, data) in [
+            (1, owned(parent, owner, &[child])),
+            (1, owned(child, parent, &[])),
+            (2, owned(parent, owner, &[])),
+            // 目标索引仍可读到旧 child 记录，但目标 parent 已不再接纳它。
+            (2, owned(child, parent, &[])),
+        ] {
+            resolver.elements.insert((sesno, data.refno), data);
+        }
+
+        let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
+            .expect("membership reconciliation");
+
+        assert_eq!(supplemented, 1);
+        assert_eq!(operation_kinds(&window)[&RefU64(parent)], "modified");
+        assert_eq!(operation_kinds(&window)[&RefU64(child)], "deleted");
+    }
+
+    #[test]
+    fn member_relocated_between_owners_is_not_deleted() {
+        let (root, old_owner, new_owner, child) = (1, 10, 11, 20);
+        let mut window = BTreeMap::from([(
+            2,
+            vec![
+                parent_modified(old_owner, root, &[child], &[], 2),
+                parent_modified(new_owner, root, &[], &[child], 2),
+            ],
+        )]);
+        let mut resolver = FakeMembershipResolver::default();
+
+        let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
+            .expect("move is decided by the two parent deltas");
+
+        assert_eq!(supplemented, 0);
+        assert!(!operation_kinds(&window).contains_key(&RefU64(child)));
+    }
+
+    #[test]
+    fn deleted_root_expands_its_unreachable_base_subtree() {
+        let (world, parent, root, leaf) = (1, 10, 20, 21);
+        let mut window =
+            BTreeMap::from([(2, vec![parent_modified(parent, world, &[root], &[], 2)])]);
+        let mut resolver = FakeMembershipResolver::default();
+        for (sesno, data) in [
+            (1, owned(parent, world, &[root])),
+            (1, owned(root, parent, &[leaf])),
+            (1, owned(leaf, root, &[])),
+            (2, owned(parent, world, &[])),
+            (2, owned(root, parent, &[leaf])),
+            (2, owned(leaf, root, &[])),
+        ] {
+            resolver.elements.insert((sesno, data.refno), data);
+        }
+
+        let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
+            .expect("subtree reconciliation");
+        let kinds = operation_kinds(&window);
+
+        assert_eq!(supplemented, 2);
+        assert_eq!(kinds[&RefU64(root)], "deleted");
+        assert_eq!(kinds[&RefU64(leaf)], "deleted");
+    }
+
+    #[test]
+    fn descendant_relocated_out_of_a_deleted_subtree_stays_live() {
+        let (world, parent, root, leaf, new_owner) = (1, 10, 20, 21, 30);
+        let mut window =
+            BTreeMap::from([(2, vec![parent_modified(parent, world, &[root], &[], 2)])]);
+        let mut resolver = FakeMembershipResolver::default();
+        for (sesno, data) in [
+            (1, owned(parent, world, &[root])),
+            (1, owned(root, parent, &[leaf])),
+            (1, owned(leaf, root, &[])),
+            (2, owned(parent, world, &[])),
+            (2, owned(root, parent, &[leaf])),
+            (2, owned(leaf, new_owner, &[])),
+            (2, owned(new_owner, world, &[leaf])),
+        ] {
+            resolver.elements.insert((sesno, data.refno), data);
+        }
+
+        reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
+            .expect("moved descendant");
+        let kinds = operation_kinds(&window);
+
+        assert_eq!(kinds[&RefU64(root)], "deleted");
+        assert!(!kinds.contains_key(&RefU64(leaf)));
+    }
+
+    #[test]
+    fn member_arbitration_parse_failure_blocks_the_window() {
+        let (owner, parent, child) = (1, 10, 20);
+        let mut window =
+            BTreeMap::from([(2, vec![parent_modified(parent, owner, &[child], &[], 2)])]);
+        let mut resolver = FakeMembershipResolver::default();
+        resolver.failures.insert((2, RefU64(child)));
+
+        let error = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
+            .expect_err("parse failure must block");
+        assert!(error.to_string().contains("injected member parse failure"));
     }
 
     /// 两端逐字段相同 = 原样重写换页，真无事发生：不合成操作。
@@ -349,13 +884,17 @@ mod tests {
     /// 只认位置的记录桩：桩里没有的位置就是解析失败——真实库里那是字典缺项的
     /// 系统记录（`MNUM not exist in attr_info_map`）。
     fn records(
-        known: Vec<(RecordLoc, EleData)>,
+        known: Vec<(RecordLoc, u64, EleData)>,
     ) -> impl FnMut(RecordLoc) -> anyhow::Result<EleData> {
         move |wanted| {
             known
                 .iter()
-                .find(|(loc, _)| *loc == wanted)
-                .map(|(_, data)| data.clone())
+                .find(|(loc, _, _)| *loc == wanted)
+                .map(|(_, refno, data)| {
+                    let mut data = data.clone();
+                    data.refno = RefU64(*refno);
+                    data
+                })
                 .ok_or_else(|| anyhow::anyhow!("MNUM not exist in attr_info_map"))
         }
     }
@@ -369,7 +908,7 @@ mod tests {
 
         let outcome = synthesize_net_window(
             net,
-            records(vec![(at(10, 0), element(&[("TYPE", "BOX")], &[]))]),
+            records(vec![(at(10, 0), 7, element(&[("TYPE", "BOX")], &[]))]),
         )
         .expect("合成");
 
@@ -426,9 +965,13 @@ mod tests {
         let outcome = synthesize_net_window(net, |wanted| {
             seen.push(wanted);
             if wanted == at(20, 0) {
-                Ok(latest.clone())
+                let mut latest = latest.clone();
+                latest.refno = RefU64(9);
+                Ok(latest)
             } else if wanted == at(19, 0) {
-                Ok(base.clone())
+                let mut base = base.clone();
+                base.refno = RefU64(9);
+                Ok(base)
             } else {
                 anyhow::bail!("桩里没有 {wanted:?}")
             }
@@ -465,7 +1008,7 @@ mod tests {
 
         let outcome = synthesize_net_window(
             net,
-            records(vec![(at(20, 0), element(&[("TYPE", "BOX")], &[]))]),
+            records(vec![(at(20, 0), 9, element(&[("TYPE", "BOX")], &[]))]),
         )
         .expect("合成");
 
@@ -483,21 +1026,50 @@ mod tests {
         assert_eq!(outcome.unparseable_finals, 0, "失败的是基版本不是终稿");
     }
 
-    /// 终稿解析不出来：跳过 + 计数 + **聚合**警告（回放路径对同一批记录同样以
-    /// `None` 落空、从未入库）。逐条刷屏会把回执淹掉，所以明细走样例。
-    ///
-    /// 回归背景：cea58087（08-14）曾把它升为整窗硬错误，而字典缺项的系统记录在
-    /// 真实文件上必现（08-17 实测 ams8000 的 `16192_1` 报 `MNUM not exist in
-    /// attr_info_map`），升硬错误等于每个含系统段的窗口整批打死。本测试若因
-    /// 「整窗失败」变红，说明容忍又被改掉了。
+    struct FailedFinalResolver {
+        identities: Vec<(RecordLoc, RawElementIdentity)>,
+    }
+
+    impl RecordResolver for FailedFinalResolver {
+        fn element_at(&mut self, _loc: RecordLoc) -> anyhow::Result<EleData> {
+            anyhow::bail!("injected canonical decode failure")
+        }
+
+        fn identity_at(&mut self, loc: RecordLoc) -> anyhow::Result<RawElementIdentity> {
+            self.identities
+                .iter()
+                .find(|(candidate, _)| *candidate == loc)
+                .map(|(_, identity)| identity.clone())
+                .ok_or_else(|| anyhow::anyhow!("identity missing"))
+        }
+    }
+
+    fn identity(refno: u64, noun_hash: i32, noun_name: &str) -> RawElementIdentity {
+        RawElementIdentity {
+            refno: RefU64(refno),
+            noun_hash,
+            noun_name: noun_name.to_owned(),
+            owner: RefU64::default(),
+        }
+    }
+
+    /// Only MNUM may be omitted after a canonical final decode failure.
     #[test]
-    fn an_unparseable_final_is_skipped_counted_and_aggregated() {
+    fn mnum_final_failure_is_skipped_counted_and_aggregated() {
         let mut net = change_set(30);
         net.added.push(net_entry(7, at(10, 0), None, Some(12)));
         net.modified
             .push(net_entry(9, at(20, 0), Some(at(19, 0)), Some(25)));
+        let mut resolver = FailedFinalResolver {
+            identities: vec![
+                (at(10, 0), identity(7, 0xC40CC, "MNUM")),
+                (at(20, 0), identity(9, 0xC40CC, "MNUM")),
+            ],
+        };
 
-        let outcome = synthesize_net_window(net, records(Vec::new())).expect("合成");
+        let outcome =
+            synthesize_net_window_with_resolver(net, SnapshotToken::for_test(), &mut resolver)
+                .expect("MNUM 合成");
 
         assert!(
             outcome.window.is_empty(),
@@ -505,6 +1077,12 @@ mod tests {
             outcome.window.keys().collect::<Vec<_>>()
         );
         assert_eq!(outcome.unparseable_finals, 2);
+        assert!(
+            outcome
+                .ignored_finals
+                .iter()
+                .all(|item| item.noun == "MNUM")
+        );
         assert_eq!(outcome.warnings.len(), 1, "明细走聚合警告，不逐条刷屏");
         let warning = &outcome.warnings[0];
         assert!(warning.contains("2 条"), "聚合警告要报条数: {warning}");
@@ -515,12 +1093,40 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_noun_final_failure_rejects_the_whole_window() {
+        let mut net = change_set(30);
+        net.added.push(net_entry(7, at(10, 0), None, Some(12)));
+        let mut resolver = FailedFinalResolver {
+            identities: vec![(at(10, 0), identity(7, 0x861E0, "BOX"))],
+        };
+
+        let error =
+            synthesize_net_window_with_resolver(net, SnapshotToken::for_test(), &mut resolver)
+                .expect_err("非白名单终稿必须失败");
+
+        assert!(format!("{error:#}").contains("非白名单终稿"));
+    }
+
+    #[test]
+    fn resolver_returning_the_wrong_refno_is_a_hard_failure() {
+        let mut net = change_set(30);
+        net.added.push(net_entry(7, at(10, 0), None, Some(12)));
+        let error = synthesize_net_window(
+            net,
+            records(vec![(at(10, 0), 99, element(&[("TYPE", "BOX")], &[]))]),
+        )
+        .expect_err("错误 refno 必须失败");
+
+        assert!(format!("{error:#}").contains("错误 refno"));
+    }
+
+    #[test]
     fn a_missing_last_touch_session_fails_instead_of_using_the_window_end() {
         let mut net = change_set(30);
         net.added.push(net_entry(7, at(10, 0), None, None));
         let error = synthesize_net_window(
             net,
-            records(vec![(at(10, 0), element(&[("TYPE", "BOX")], &[]))]),
+            records(vec![(at(10, 0), 7, element(&[("TYPE", "BOX")], &[]))]),
         )
         .err()
         .expect("last-touch 缺失必须整窗失败");
@@ -536,7 +1142,7 @@ mod tests {
 
         let outcome = synthesize_net_window(
             net,
-            records(vec![(at(20, 0), element(&[("TYPE", "BOX")], &[]))]),
+            records(vec![(at(20, 0), 9, element(&[("TYPE", "BOX")], &[]))]),
         );
 
         let Err(error) = outcome else {
@@ -560,7 +1166,7 @@ mod tests {
 
         let outcome = synthesize_net_window(
             net,
-            records(vec![(at(20, 0), same.clone()), (at(19, 0), same)]),
+            records(vec![(at(20, 0), 9, same.clone()), (at(19, 0), 9, same)]),
         )
         .expect("合成");
 
