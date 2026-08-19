@@ -88,8 +88,23 @@ pub struct NetWindowOutcome {
     /// E3D 删除后旧物理记录可能仍被索引遍历触达；只有这个计数能把“索引仍见、
     /// 成员关系已死”的收口显式暴露给上层口径日志。
     pub membership_deleted: usize,
+    /// 窗口内诞生又被删、因此整条丢弃的新增数（既不发 Add 也不发 Deleted）。
+    ///
+    /// 净口径是「窗口内加了又删不出现」，但索引侧分不清「新建且活着」与「新建后
+    /// 被删、孤儿记录留在索引里」——不显式记账的话，这种丢弃与「本来就没有这个
+    /// 元素」在证据里长得一模一样。
+    pub dropped_phantom_adds: usize,
     /// 差分统计（页读数/剪枝/耗时），随回执与日志透出。
     pub stats: session_index_diff::NetChangeStats,
+}
+
+/// 成员收口的两项产出。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct MemberReconciliation {
+    /// 双根差分没判出、由目标端成员关系补出的删除数。
+    membership_deleted: usize,
+    /// 被整条丢弃的幽灵新增数，见 [`NetWindowOutcome::dropped_phantom_adds`]。
+    dropped_phantom_adds: usize,
 }
 
 /// 对一个已打开（或可打开）的库文件做净窗口收集。
@@ -128,13 +143,15 @@ pub fn collect_net_window(
     let mut resolver = PdmsRecordResolver { io };
     let mut outcome = synthesize_net_window_with_resolver(net, token.clone(), &mut resolver)
         .map_err(|error| NetWindowError::incomplete("终稿合成", error))?;
-    outcome.membership_deleted = reconcile_member_deletions(
+    let reconciliation = reconcile_member_deletions(
         &mut outcome.window,
         base_sesno,
         target_sesno,
         &mut PdmsMembershipResolver { io: resolver.io },
     )
     .map_err(|error| NetWindowError::incomplete("成员删除收口", error))?;
+    outcome.membership_deleted = reconciliation.membership_deleted;
+    outcome.dropped_phantom_adds = reconciliation.dropped_phantom_adds;
     snapshot
         .verify_path_identity()
         .map_err(|error| NetWindowError::incomplete("提交前文件身份校验", error))?;
@@ -246,15 +263,70 @@ fn is_target_member<R: MembershipResolver>(
     Ok(owner.children.contains(&refno))
 }
 
-/// 用目标成员关系收口删除，并沿基版本成员树展开不可达子树。
+/// 窗口内诞生的元素（本窗口里有 `Add`）。
+fn window_born_refnos(window: &BTreeMap<u32, Vec<EleOperationData>>) -> BTreeSet<RefU64> {
+    window
+        .values()
+        .flatten()
+        .filter(|operation| matches!(operation.detail, EleOperationDetail::Add(_)))
+        .map(|operation| operation.refno)
+        .collect()
+}
+
+/// 窗口塌缩收口：元素在窗口内诞生**又**被删时，OWNER 的成员表在窗口两端都没有
+/// 它，`children_changed` 因此为空——[`member_deltas`] 那条判据看不见；而索引侧
+/// 分不清「新建且活着」与「新建后被删、孤儿记录留在索引里」，一律判 `Added`。
 ///
-/// 返回本轮新补出的 `Deleted` 数；双根差分本来已有的删除不计入该数字。
+/// 生产上这不是边界情形：窗口是 `[水位+1, 观察到的最新]`，用户建了件、存盘、发现
+/// 不对再删掉、再存盘，两个会话落进同一次扫描是常态。
+///
+/// 这里对每条 `Added` 问一次目标端 OWNER 认不认它，按 OWNER 去重（一个 OWNER 只查
+/// 一次记录）。只在能证伪时下结论：OWNER 为空、OWNER 在目标端读不到，都当活着
+/// ——宁可漏判，也不凭空删。
+fn orphaned_adds<R: MembershipResolver>(
+    window: &BTreeMap<u32, Vec<EleOperationData>>,
+    target_sesno: i32,
+    resolver: &mut R,
+) -> anyhow::Result<BTreeSet<RefU64>> {
+    let mut by_owner: BTreeMap<RefU64, BTreeSet<RefU64>> = BTreeMap::new();
+    for operation in window.values().flatten() {
+        let EleOperationDetail::Add(added) = &operation.detail else {
+            continue;
+        };
+        if added.owner == RefU64::default() {
+            continue;
+        }
+        by_owner
+            .entry(added.owner)
+            .or_default()
+            .insert(operation.refno);
+    }
+    let mut orphans = BTreeSet::new();
+    for (owner, members) in by_owner {
+        // OWNER 自己在目标端都读不到：这批的死活由 OWNER 那条判据连坐收口。
+        let Some(owner_element) = resolver.element_at(owner, target_sesno)? else {
+            continue;
+        };
+        orphans.extend(
+            members
+                .into_iter()
+                .filter(|refno| !owner_element.children.contains(refno)),
+        );
+    }
+    Ok(orphans)
+}
+
+/// 用目标成员关系收口删除，并沿成员树展开不可达子树。
+///
+/// 两项产出见 [`MemberReconciliation`]：双根差分本来已有的删除不计入补删数；
+/// 窗口内诞生又死掉的元素整条丢弃，不发 `Deleted`——下游从来没存过它，一条删除
+/// 只会凭空造出一行墓碑。
 fn reconcile_member_deletions<R: MembershipResolver>(
     window: &mut BTreeMap<u32, Vec<EleOperationData>>,
     base_sesno: Option<i32>,
     target_sesno: i32,
     resolver: &mut R,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<MemberReconciliation> {
     let (removed, attached) = member_deltas(window);
     let existing_deleted = window
         .values()
@@ -262,13 +334,16 @@ fn reconcile_member_deletions<R: MembershipResolver>(
         .filter(|operation| matches!(operation.detail, EleOperationDetail::Deleted))
         .map(|operation| operation.refno)
         .collect::<BTreeSet<_>>();
+    let window_born = window_born_refnos(window);
+    let phantoms = orphaned_adds(window, target_sesno, resolver)?;
     let roots = removed
         .difference(&attached)
         .copied()
         .chain(existing_deleted.iter().copied())
+        .chain(phantoms.iter().copied())
         .collect::<BTreeSet<_>>();
     if roots.is_empty() {
-        return Ok(0);
+        return Ok(MemberReconciliation::default());
     }
     let base_sesno = base_sesno
         .ok_or_else(|| anyhow::anyhow!("成员删除候选存在，但窗口没有可展开删除子树的基会话"))?;
@@ -276,7 +351,10 @@ fn reconcile_member_deletions<R: MembershipResolver>(
     let mut dead = BTreeSet::new();
     let mut queue = VecDeque::new();
     for root in roots {
-        if existing_deleted.contains(&root) || !is_target_member(resolver, root, target_sesno)? {
+        if existing_deleted.contains(&root)
+            || phantoms.contains(&root)
+            || !is_target_member(resolver, root, target_sesno)?
+        {
             queue.push_back(root);
         }
     }
@@ -285,10 +363,22 @@ fn reconcile_member_deletions<R: MembershipResolver>(
         if !dead.insert(refno) {
             continue;
         }
-        let base = resolver.element_at(refno, base_sesno)?.ok_or_else(|| {
-            anyhow::anyhow!("删除子树元素 {refno} 在基会话 sesno={base_sesno} 不存在，拒绝猜测")
-        })?;
-        for child in base.children.iter().copied() {
+        // 展开子树的依据：窗口外就存在的元素看基会话那份成员表；窗口内诞生的幽灵
+        // 在基会话根本没有记录，只能看它创建时写下、之后再没被改过的那一份。
+        let expand_from = match resolver.element_at(refno, base_sesno)? {
+            Some(base) => base,
+            None => {
+                anyhow::ensure!(
+                    window_born.contains(&refno),
+                    "删除子树元素 {refno} 在基会话 sesno={base_sesno} 不存在，拒绝猜测"
+                );
+                let Some(target) = resolver.element_at(refno, target_sesno)? else {
+                    continue;
+                };
+                target
+            }
+        };
+        for child in expand_from.children.iter().copied() {
             if dead.contains(&child) {
                 continue;
             }
@@ -320,21 +410,30 @@ fn reconcile_member_deletions<R: MembershipResolver>(
     }
 
     if dead.is_empty() {
-        return Ok(0);
+        return Ok(MemberReconciliation::default());
     }
     // 终态唯一：成员删除覆盖同 refno 的 Add/Modified，也与索引 Deleted 去重。
     for operations in window.values_mut() {
         operations.retain(|operation| !dead.contains(&operation.refno));
     }
-    let membership_deleted = dead.difference(&existing_deleted).count();
+    // 窗口内诞生又死掉的只丢不删（净口径「加了又删不出现」）；窗口外就存在的
+    // 才发 Deleted。
+    let (phantom_dead, prior_dead): (BTreeSet<_>, BTreeSet<_>) = dead
+        .into_iter()
+        .partition(|refno| window_born.contains(refno));
+    let membership_deleted = prior_dead.difference(&existing_deleted).count();
     let target = u32::try_from(target_sesno)
         .map_err(|_| anyhow::anyhow!("成员删除目标会话非法: {target_sesno}"))?;
     let operations = window.entry(target).or_default();
     operations.extend(
-        dead.into_iter()
+        prior_dead
+            .into_iter()
             .map(|refno| EleOperationData::new(refno, target, EleOperationDetail::Deleted)),
     );
-    Ok(membership_deleted)
+    Ok(MemberReconciliation {
+        membership_deleted,
+        dropped_phantom_adds: phantom_dead.len(),
+    })
 }
 
 trait RecordResolver {
@@ -556,6 +655,7 @@ fn synthesize_net_window_with_resolver(
         unparseable_finals: ignored_finals.len(),
         ignored_finals,
         membership_deleted: 0,
+        dropped_phantom_adds: 0,
         stats,
     })
 }
@@ -701,7 +801,8 @@ mod tests {
         }
 
         let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
-            .expect("membership reconciliation");
+            .expect("membership reconciliation")
+            .membership_deleted;
 
         assert_eq!(supplemented, 1);
         assert_eq!(operation_kinds(&window)[&RefU64(parent)], "modified");
@@ -721,7 +822,8 @@ mod tests {
         let mut resolver = FakeMembershipResolver::default();
 
         let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
-            .expect("move is decided by the two parent deltas");
+            .expect("move is decided by the two parent deltas")
+            .membership_deleted;
 
         assert_eq!(supplemented, 0);
         assert!(!operation_kinds(&window).contains_key(&RefU64(child)));
@@ -745,7 +847,8 @@ mod tests {
         }
 
         let supplemented = reconcile_member_deletions(&mut window, Some(1), 2, &mut resolver)
-            .expect("subtree reconciliation");
+            .expect("subtree reconciliation")
+            .membership_deleted;
         let kinds = operation_kinds(&window);
 
         assert_eq!(supplemented, 2);
@@ -777,6 +880,67 @@ mod tests {
 
         assert_eq!(kinds[&RefU64(root)], "deleted");
         assert!(!kinds.contains_key(&RefU64(leaf)));
+    }
+
+    /// 窗口塌缩：元素在窗口内诞生又被删（apply 建、restore 删，两次 SAVEWORK 落进
+    /// 同一次扫描）。两端 OWNER 成员表都没有它，`children_changed` 为空，索引侧只
+    /// 会判 Added。净口径要求它「不出现」——既不能留成幽灵新增，也不能发一条下游
+    /// 从来没存过的 Deleted。
+    #[test]
+    fn add_created_and_deleted_inside_the_window_is_dropped() {
+        let (owner, parent, child) = (1, 10, 20);
+        let mut window = BTreeMap::from([(
+            2,
+            vec![EleOperationData::new(
+                RefU64(child),
+                2,
+                EleOperationDetail::Add(owned(child, parent, &[])),
+            )],
+        )]);
+        let mut resolver = FakeMembershipResolver::default();
+        for (sesno, data) in [
+            (0, owned(parent, owner, &[])),
+            // 目标端仍能点查到孤儿记录，但 parent 的成员表里已经没有它。
+            (2, owned(parent, owner, &[])),
+            (2, owned(child, parent, &[])),
+        ] {
+            resolver.elements.insert((sesno, data.refno), data);
+        }
+
+        let reconciliation = reconcile_member_deletions(&mut window, Some(0), 2, &mut resolver)
+            .expect("collapsed window reconciliation");
+
+        assert_eq!(reconciliation.dropped_phantom_adds, 1);
+        assert_eq!(reconciliation.membership_deleted, 0);
+        assert!(!operation_kinds(&window).contains_key(&RefU64(child)));
+    }
+
+    /// 反向守卫：目标端 OWNER 的成员表里有它，那就是一次普通新增，这条收口不许碰。
+    #[test]
+    fn add_still_listed_by_its_target_owner_survives() {
+        let (owner, parent, child) = (1, 10, 20);
+        let mut window = BTreeMap::from([(
+            2,
+            vec![EleOperationData::new(
+                RefU64(child),
+                2,
+                EleOperationDetail::Add(owned(child, parent, &[])),
+            )],
+        )]);
+        let mut resolver = FakeMembershipResolver::default();
+        for (sesno, data) in [
+            (0, owned(parent, owner, &[])),
+            (2, owned(parent, owner, &[child])),
+            (2, owned(child, parent, &[])),
+        ] {
+            resolver.elements.insert((sesno, data.refno), data);
+        }
+
+        let reconciliation = reconcile_member_deletions(&mut window, Some(0), 2, &mut resolver)
+            .expect("live add reconciliation");
+
+        assert_eq!(reconciliation, MemberReconciliation::default());
+        assert_eq!(operation_kinds(&window)[&RefU64(child)], "add");
     }
 
     #[test]
