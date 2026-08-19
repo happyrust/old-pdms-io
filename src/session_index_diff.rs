@@ -657,12 +657,107 @@ pub(crate) fn contains_refnos_at(
         return Ok(BTreeSet::new());
     }
     let (target_root, _) = session_anchor(io, target_sesno)?;
-    let walked = walk_tree(io, target_root, |_| false)?;
-    Ok(candidates
+    contains_candidates(io, target_root, candidates)
+}
+
+/// Resolve only the routes that can contain one of `candidates`.
+///
+/// A Dabacon index can retain obsolete non-index page pointers in ranges no
+/// point lookup would select.  Full-tree walking is correct for net-window
+/// enumeration, where every reachable branch is material, but it is too broad
+/// for a candidate-presence question: an unrelated stale pointer must not make
+/// a valid candidate indeterminate.  Once a candidate selects a route, however,
+/// every read and level check on that route remains strict.
+fn contains_candidates<P: IndexPages>(
+    pages: &mut P,
+    root: u32,
+    candidates: &BTreeSet<RefU64>,
+) -> anyhow::Result<BTreeSet<RefU64>> {
+    let mut found = BTreeSet::new();
+    let mut visited = HashSet::new();
+    let initial = candidates
         .iter()
-        .filter(|refno| walked.touched.contains_key(refno))
-        .copied()
-        .collect())
+        .map(|refno| ((refno.get_0(), refno.get_1()), *refno))
+        .collect::<Vec<_>>();
+    let mut stack = vec![(root, u32::MAX, KeyBounds::default(), true, initial)];
+
+    while let Some((pgno, parent_level, bounds, is_root, pending)) = stack.pop() {
+        if pending.is_empty() || !visited.insert(pgno) {
+            continue;
+        }
+        let page = pages.index_page(pgno).map_err(|error| {
+            let kind = if is_root {
+                "根页"
+            } else {
+                "候选路由子页"
+            };
+            error.context(format!("读取索引{kind} {pgno} 失败，快照不完整"))
+        })?;
+        anyhow::ensure!(
+            page.level < parent_level,
+            "索引页 {pgno} 层级 {} 未低于父层级 {parent_level}，快照不完整",
+            page.level
+        );
+
+        if page.level == 0 {
+            let pending_keys = pending
+                .iter()
+                .map(|(key, refno)| (*key, *refno))
+                .collect::<HashMap<_, _>>();
+            for loc in &page.refno_locs {
+                if loc.is_start_page() {
+                    continue;
+                }
+                let key = (loc.refno_0, loc.refno_1);
+                if bounds.contains(key)
+                    && let Some(refno) = pending_keys.get(&key)
+                {
+                    found.insert(*refno);
+                }
+            }
+            continue;
+        }
+
+        let mut sentinel_child = None;
+        let mut kept = Vec::new();
+        let mut seen_keys = HashSet::new();
+        for loc in &page.refno_locs {
+            if loc.is_start_page() {
+                sentinel_child.get_or_insert(loc.pgno);
+                continue;
+            }
+            let key = (loc.refno_0, loc.refno_1);
+            if !seen_keys.insert(key) || kept.last().is_some_and(|(last, _)| key <= *last) {
+                continue;
+            }
+            kept.push((key, loc.pgno));
+        }
+
+        let mut push_route = |child: u32, child_bounds: KeyBounds| {
+            if child_bounds.is_empty() {
+                return;
+            }
+            let selected = pending
+                .iter()
+                .filter(|(key, _)| child_bounds.contains(*key))
+                .copied()
+                .collect::<Vec<_>>();
+            if !selected.is_empty() {
+                stack.push((child, page.level, child_bounds, false, selected));
+            }
+        };
+
+        let first_key = kept.first().map(|(key, _)| *key);
+        if let Some(child) = sentinel_child {
+            push_route(child, bounds.narrowed(None, first_key));
+        }
+        for (index, &(key, child)) in kept.iter().enumerate() {
+            let next_key = kept.get(index + 1).map(|(next, _)| *next);
+            push_route(child, bounds.narrowed(Some(key), next_key));
+        }
+    }
+
+    Ok(found)
 }
 
 #[cfg(test)]
@@ -729,6 +824,44 @@ mod tests {
 
     fn r(r1: u32) -> RefU64 {
         RefU64::from_two_nums(100, r1)
+    }
+
+    #[test]
+    fn candidate_presence_does_not_read_an_unselected_stale_pointer() {
+        let mut pages = MemPages::new(vec![
+            (
+                70,
+                page(
+                    1,
+                    vec![loc(SENTINEL, SENTINEL, 5696, 0, 1), loc(100, 10, 72, 0, 1)],
+                ),
+            ),
+            (72, page(0, vec![loc(100, 20, 73, 0, 1)])),
+        ]);
+
+        let found = contains_candidates(&mut pages, 70, &BTreeSet::from([r(20)]))
+            .expect("unrelated stale pointer must not poison candidate presence");
+
+        assert_eq!(found, BTreeSet::from([r(20)]));
+        assert_eq!(pages.reads, vec![70, 72]);
+        assert!(!pages.reads.contains(&5696));
+    }
+
+    #[test]
+    fn candidate_presence_keeps_selected_route_failures_strict() {
+        let mut pages = MemPages::new(vec![(
+            70,
+            page(
+                1,
+                vec![loc(SENTINEL, SENTINEL, 5696, 0, 1), loc(100, 10, 72, 0, 1)],
+            ),
+        )]);
+
+        let error = contains_candidates(&mut pages, 70, &BTreeSet::from([r(5)]))
+            .expect_err("candidate-selected unreadable child must fail");
+
+        assert!(format!("{error:#}").contains("候选路由子页 5696"));
+        assert_eq!(pages.reads, vec![70, 5696]);
     }
 
     /// 叶层四态一次说死：新增 / 删除 / 位置变了是修改 / 位置没变（重写页里原样
