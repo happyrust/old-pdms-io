@@ -3140,7 +3140,6 @@ impl PdmsIO {
             file.seek(SeekFrom::Start(offset))?;
             file.read_exact(&mut ses_data)?;
             // dbg!(ses_pgno);
-            SessionPageData::try_from(ses_data.as_ref()).unwrap();
             if let Ok(mut s) = SessionPageData::try_from(ses_data.as_ref()) {
                 s.pgno = ses_pgno as _;
                 // dbg!(ses_pgno);
