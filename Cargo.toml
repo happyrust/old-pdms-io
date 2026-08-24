@@ -45,8 +45,8 @@ required-features = ["legacy_session_replay"]
 anyhow = "1.0"
 deku = "0.16.0"
 memchr = "2.7.2"
-aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "f9f1bf0fbaea710ce4393958266bded6f4597da0", default-features = false }
-parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "313ba91b7eac4a5254d36759cf28d8bf5ba0894a" }
+aios_core = { git = "https://github.com/happyrust/old-aios-core.git", rev = "b546648cdc454656a31d866d93ae859af2f39eb6", default-features = false }
+parse_pdms_db = { git = "https://github.com/happyrust/old-parse-pdms-db.git", rev = "78cc3ca1504d13e1dce41dba6664a788a81259e7" }
 nom = "7.1.3"
 notify = "8.0.0"
 futures = "0.3.28"
