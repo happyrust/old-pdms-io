@@ -64,7 +64,7 @@ dependencies = [
 [[package]]
 name = "aios_core"
 version = "0.2.0"
-source = "git+https://github.com/happyrust/old-aios-core.git?rev=b216704184f5be9a230a0ec7fa90e79f60b01d34#b216704184f5be9a230a0ec7fa90e79f60b01d34"
+source = "git+https://github.com/happyrust/old-aios-core.git?rev=6f95b65adcd485e00d3bdaae1f4391f8d288e320#6f95b65adcd485e00d3bdaae1f4391f8d288e320"
 dependencies = [
  "anyhow",
  "approx 0.5.1",
@@ -4373,7 +4373,7 @@ dependencies = [
 [[package]]
 name = "parse_pdms_db"
 version = "3.0.0"
-source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=66dfb52#66dfb523019f1ead8cc72bb2708b5a0139cb4887"
+source = "git+https://github.com/happyrust/old-parse-pdms-db.git?rev=20fbac4#20fbac4be632cd7469019101562701b8cc72841d"
 dependencies = [
  "aios_core",
  "anyhow",
