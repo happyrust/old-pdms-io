@@ -9,7 +9,6 @@ use derivative::Derivative;
 use serde::{Deserialize, Serialize};
 use std::convert::{TryFrom, TryInto};
 use std::str::FromStr;
-use surrealdb::sql::Thing;
 
 pub const PAGE_SIZE: usize = 0x800;
 

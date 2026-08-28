@@ -1,5 +1,3 @@
-#![feature(windows_by_handle)]
-
 pub mod common;
 pub mod config;
 pub mod defines;
